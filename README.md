@@ -42,6 +42,35 @@ Two short IL sequences are injected into Emby's own assemblies:
 Which sources match is decided by a URL prefix list you configure. The prefixes are **not**
 compiled into the binary.
 
+## When 302 is not enough
+
+302 takes the server out of the transfer. It does not add bandwidth. If your origin caps **each
+connection** rather than total throughput, the client inherits that same single-connection limit
+and a high-bitrate file still stutters after the patch — the bottleneck simply moved.
+
+Worth ruling out before you go looking for a bug here. Compare one connection against four:
+
+```bash
+URL='https://origin.example.com/large-file.mkv'   # signed, if your origin requires it
+
+probe() {   # $1 parallel 32 MiB range fetches, aggregate throughput
+  for i in $(seq "$1"); do
+    off=$(( i * 100000000 ))
+    curl -s -o /dev/null -r "$off-$(( off + 33554431 ))" -w '%{speed_download}\n' "$URL" &
+  done
+  wait
+}
+for n in 1 4; do
+  printf '%d connection(s): ' "$n"
+  probe "$n" | awk '{s+=$1} END {printf "%.1f Mbps\n", s*8/1e6}'
+done
+```
+
+Roughly flat means you are limited by the pipe, and 302 is the right fix. Roughly 4× means the
+cap is per connection, and no direct-play scheme reaches the source faster than one connection
+allows — the file has to be pulled over several connections at once. That is a different patch,
+not a setting in this one.
+
 ## Design properties
 
 - **No configuration means stock behaviour.** With an empty or missing prefix list the matcher
