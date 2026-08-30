@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <AssemblyName>StrmDirectTemplate</AssemblyName>
+    <RootNamespace>StrmDirectTemplate</RootNamespace>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Optimize>false</Optimize>
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+</Project>
