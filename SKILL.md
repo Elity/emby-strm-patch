@@ -20,6 +20,28 @@ and with no configuration present the patch is inert.
 
 The two patches are independent; either can be applied or rolled back alone.
 
+## What the patcher looks for
+
+The patcher locates its targets by type and method **signature**, never by file offset, so it
+normally works across Emby versions without changes. If it reports a target it cannot find, the
+names have moved — these are the semantics to look for, and `references/internals.md` walks
+through re-deriving them:
+
+**Patch A** — the method that finalises playback capabilities for **one** `MediaSourceInfo`
+during PlaybackInfo. Recognisable by: it takes a single `MediaSourceInfo` (the sibling overload
+takes the whole response and loops), it constructs a `StreamBuilder` and options object, and it
+contains Emby's own lever — `!SupportsTranscoding` drives `ForceDirectPlay` / `ForceDirectStream`
+and an early `return` placed **before** `TranscodingUrl` is assigned. Goal: make matched sources
+report that they do not support transcoding, and let Emby's existing code do the rest.
+
+**Patch B** — the convergence point for static/progressive file responses, where the path being
+served is `MediaSourceInfo.Path` verbatim. Recognisable by: it takes an options object exposing a
+`Path` property, and its declaring type also exposes a factory that builds a redirect result.
+Goal: for matched paths, return that redirect instead of streaming the bytes.
+
+If two or more identifying traits no longer hold, stop and re-read the code rather than forcing
+the patch through.
+
 ## Step 0 — Locate the Emby installation (required, do not skip)
 
 **Stop here and establish the paths before touching anything else.** Emby's layout differs per
@@ -86,11 +108,15 @@ patch    : B - 302 redirect from the streaming endpoint
 OK       : wrote .../Emby.Server.Implementations.dll
 ```
 
+The `IL before` count varies by Emby version — ignore it. What must hold is the `matcher` line,
+the right patch being selected, the delta (**+11** for B, **+9** for A), and the `OK` line.
+
 Failure modes:
 
 - `x No known target type in this assembly` — wrong input file.
-- `x ... not found` (a specific type or method) — Emby changed the shape. Go to
-  `references/internals.md` → *Re-deriving on a new Emby version*. Do not improvise.
+- `x ... not found` (a specific type or method) — Emby changed the shape. Re-read *What the
+  patcher looks for* above, then `references/internals.md` → *Re-deriving on a new Emby version*.
+  Do not improvise.
 - `x Already patched` — the input was a patched assembly, not stock.
 - `x Template references another type in its own assembly` — only happens if you edited
   `template/StrmDirect.cs`; read the constraints at the top of that file.
@@ -217,8 +243,14 @@ Symptom: .strm playback starts stuttering or transcoding again, with no configur
 1. sha256 both assemblies. If they match stock, the upgrade reverted the patch.
 2. Re-run Steps 2 → 3 → 5 → 6 against the new version. Record the new sha values.
 3. The patcher locates its targets by type and method **signature**, not by offset, so a minor
-   upgrade usually just works. If it reports a target it cannot find, stop and read
-   `references/internals.md` → *Re-deriving on a new Emby version*.
+   upgrade usually just works. If it reports a target it cannot find, re-read *What the patcher
+   looks for* near the top, then `references/internals.md` → *Re-deriving on a new Emby version*.
+
+## Changing the patcher itself
+
+`bash tests/run.sh` patches two synthetic assemblies shaped like Emby's, then invokes the patched
+methods and checks the results — no Emby binaries involved. Run it after touching anything in
+`patcher/` or `template/`. CI runs the same script on Linux, Windows and macOS.
 
 ## Adding or changing a URL prefix
 
@@ -249,4 +281,5 @@ Edit `strm-direct.txt`. Takes effect within 30 seconds. No rebuild, no restart, 
 - `patcher/TypeCloner.cs` — deep-copies the matcher type into the target assembly
 - `template/StrmDirect.cs` — the prefix matcher, ordinary C#; constraints documented in-file
 - `rtcheck/` — loads a patched assembly and executes the matcher, 18 assertions
+- `tests/run.sh` — full offline test: patches synthetic assemblies and checks real behaviour
 - `strm-direct.txt.example` — annotated configuration template

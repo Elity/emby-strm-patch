@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      # Patches two synthetic assemblies shaped like Emby's, then invokes the patched
+      # methods and checks the results. No Emby binaries are needed or used.
+      # Running on three platforms exercises the config path resolution, which is
+      # filesystem-dependent.
+      - name: Run tests
+        shell: bash
+        run: bash tests/run.sh

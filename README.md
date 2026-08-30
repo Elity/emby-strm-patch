@@ -1,5 +1,7 @@
 # emby-strm-follow-302
 
+[![CI](https://github.com/Elity/emby-strm-follow-302/actions/workflows/ci.yml/badge.svg)](https://github.com/Elity/emby-strm-follow-302/actions/workflows/ci.yml)
+
 Make Emby answer **302** for `.strm` media instead of relaying it — and stop it from transcoding
 remote sources it has no business transcoding.
 
@@ -8,7 +10,7 @@ Clone it into your skills directory and ask your agent to patch Emby; it will wa
 starting by confirming where your Emby install lives.
 
 ```bash
-git clone https://github.com/<you>/emby-strm-follow-302 ~/.claude/skills/emby-strm-follow-302
+git clone https://github.com/Elity/emby-strm-follow-302 ~/.claude/skills/emby-strm-follow-302
 ```
 
 Everything it does is also documented well enough to follow by hand — see `SKILL.md`.
@@ -50,16 +52,28 @@ compiled into the binary.
 - **Config reloads in 30 seconds.** Adding a URL prefix needs no rebuild and no restart.
 - **The two patches are independent.** Apply or roll back either alone.
 - **Idempotent.** A marker field on the patched type makes a second run refuse rather than stack.
-- **Version-tolerant.** Targets are located by type and method signature, not by file offset, so
-  a minor Emby upgrade usually needs nothing but a re-run.
+- **Not pinned to an Emby version.** Targets are located by type and method signature, not by
+  file offset. `SKILL.md` states what each target is *semantically*, so when Emby moves things
+  the target can be re-identified rather than guessed; `references/internals.md` walks through it.
 
 ## Requirements
 
 - .NET SDK 8.0 or newer
-- Emby Server 4.9.x (other versions are likely fine — the patcher will tell you if a target no
-  longer matches)
-- Write access to Emby's `system/` directory and the ability to restart the server
+- An Emby Server install you can write to and restart
 - The patcher runs on the same machine as Emby
+
+The patcher tells you immediately if a target no longer matches, so trying it costs a build and
+nothing else — it never writes to your install.
+
+## Tests
+
+```bash
+bash tests/run.sh
+```
+
+Patches two synthetic assemblies shaped like Emby's, then invokes the patched methods and checks
+what they actually return. No Emby binaries required, which is also how CI runs it (Linux,
+Windows and macOS).
 
 ## Layout
 
@@ -69,7 +83,8 @@ references/internals.md     injection points, IL, and how to re-derive them
 patcher/                    target detection and both injections (Mono.Cecil)
 patcher/TypeCloner.cs       deep-copies the matcher type into the target assembly
 template/StrmDirect.cs      the prefix matcher, ordinary C#
-rtcheck/                    loads a patched assembly and executes the matcher (18 assertions)
+rtcheck/                    loads a patched assembly and executes the matcher
+tests/                      synthetic fixtures plus the behavioural test runner
 strm-direct.txt.example     annotated configuration template
 ```
 
