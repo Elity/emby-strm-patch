@@ -58,6 +58,8 @@ namespace EmbyStrmParallel
         private Exception _fatal;             // worker died outside a chunk; nothing poisoned a channel
 
         private PreOpenedChunk _preOpened;
+        /// <summary>Workers queued on the origin budget when Dispose ran. See Dispose.</summary>
+        private int _blockedOnBudgetAtClose;
 
         // reader-side state (single consumer)
         private long _readerChunk;
@@ -439,6 +441,15 @@ namespace EmbyStrmParallel
         {
             if (Interlocked.Exchange(ref _disposed, 1) == 0)
             {
+                // Snapshot BEFORE cancelling. Cancelling a queued permit wait can complete it
+                // inline on this very thread, so reading the count afterwards asks "how many are
+                // still waiting now that I have woken them", whose answer is always none on a
+                // platform that happens to run the continuation synchronously - which is how this
+                // passed on macOS and Linux and reported nothing on Windows. The number worth
+                // logging is how many workers this stream was holding up ON the budget at the
+                // moment it was thrown away.
+                _blockedOnBudgetAtClose = _stats.PermitWaiters;
+
                 // Order matters. Set the fault flag first so a worker that is *between*
                 // Task.Run and its first await cannot claim a chunk and issue a request we
                 // would then have to chase down.
@@ -508,7 +519,7 @@ namespace EmbyStrmParallel
                            // when it is: this stream is closing with workers still queued for the
                            // origin's budget, which is the difference between "the origin was
                            // slow" and "we throttled ourselves and never said so".
-                           (_stats.PermitWaiters > 0 ? " blockedOnBudget=" + _stats.PermitWaiters : "") +
+                           (_blockedOnBudgetAtClose > 0 ? " blockedOnBudget=" + _blockedOnBudgetAtClose : "") +
                            (_fault != null ? " fault=" + _fault.GetType().Name : ""));
         }
 
