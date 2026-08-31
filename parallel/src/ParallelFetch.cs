@@ -123,8 +123,21 @@ namespace EmbyStrmParallel
 
             // The probe IS chunk 0. The origin costs ~1.7s to first byte (302 -> signed CDN url),
             // so a separate HEAD/size probe would double time-to-first-byte for no benefit.
-            long probeSpan = ChunkSchedule.ProbeSpan(length, o.FirstChunkSize);
-            long probeEnd = offset + probeSpan - 1;
+            //
+            // The probe runs BEFORE the resource size is known, so its span is a guess, and near
+            // the end of the resource that guess runs past EOF - exactly what a player's MKV
+            // index read at the tail does. RFC 7233 says a server should clamp such a range; this
+            // origin answers 200 with the WHOLE resource instead, which used to strand the
+            // fetcher discarding gigabytes to deliver a few bytes. Measured and deterministic:
+            // end past EOF -> 200, end clamped to EOF -> 206, open-ended -> 206.
+            //
+            // SendProbe therefore retries once open-ended on a 200, which cannot overshoot by
+            // construction. Bounded stays the first choice because an open-ended probe makes the
+            // origin stream everything to EOF while we consume only chunk 0 from it - fine for a
+            // tail read, wasteful for the whole-file request that is by far the most common one.
+            // Every later chunk is bounded by ChunkSchedule against the total learned here and
+            // can never exceed EOF.
+            long probeEnd = offset + ChunkSchedule.ProbeSpan(length, o.FirstChunkSize) - 1;
 
             // A 200 here means the origin ignored Range, and the only way to honour the request
             // from a whole-resource body is to read and discard everything ahead of `offset`.
@@ -132,13 +145,16 @@ namespace EmbyStrmParallel
             // ParallelFetchOptions.MaxIgnoredRangeSkipBytes.
             bool refuseWholeBody = offset > o.MaxIgnoredRangeSkipBytes;
 
-            HttpResponseMessage response = SendProbe(client, url, offset, probeEnd, o, refuseWholeBody, cancellationToken);
+            bool probeWentOpenEnded;
+            HttpResponseMessage response = SendProbe(client, url, offset, probeEnd, o, refuseWholeBody,
+                                                     out probeWentOpenEnded, cancellationToken);
             bool handedOff = false;
             try
             {
                 if (response.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
                 {
-                    throw new IOException("Origin rejected range " + offset + "-" + probeEnd + " (416).");
+                    throw new IOException("Origin rejected range " + offset + "-" +
+                                          probeEnd.ToString(CultureInfo.InvariantCulture) + " (416).");
                 }
 
                 HttpRangeHelper.EnsureIdentityEncoding(response);
@@ -184,7 +200,7 @@ namespace EmbyStrmParallel
                 {
                     throw new IOException("Content-Range start " + from + " does not match requested " + offset + ".");
                 }
-                if (to > probeEnd)
+                if (!probeWentOpenEnded && to > probeEnd)
                 {
                     throw new IOException("Content-Range end " + to + " exceeds requested " + probeEnd + ".");
                 }
@@ -247,11 +263,20 @@ namespace EmbyStrmParallel
             }
         }
 
+        private sealed class ProbeResult
+        {
+            internal HttpResponseMessage Response;
+            internal bool OpenEnded;
+        }
+
         private static HttpResponseMessage SendProbe(HttpClient client, string url, long from, long toInclusive,
                                                      ParallelFetchOptions o, bool refuseWholeBody,
-                                                     CancellationToken cancellationToken)
+                                                     out bool wentOpenEnded, CancellationToken cancellationToken)
         {
-            return SendProbeAsync(client, url, from, toInclusive, o, refuseWholeBody, cancellationToken).GetAwaiter().GetResult();
+            ProbeResult r = SendProbeAsync(client, url, from, toInclusive, o, refuseWholeBody, cancellationToken)
+                            .GetAwaiter().GetResult();
+            wentOpenEnded = r.OpenEnded;
+            return r.Response;
         }
 
         /// <summary>
@@ -264,11 +289,13 @@ namespace EmbyStrmParallel
         /// under concurrent load, so a 200 there is worth retrying; if every attempt gives one,
         /// the throw becomes a null from TryOpen and Emby serves the request itself.
         /// </summary>
-        private static async Task<HttpResponseMessage> SendProbeAsync(HttpClient client, string url, long from, long toInclusive,
-                                                                      ParallelFetchOptions o, bool refuseWholeBody,
-                                                                      CancellationToken cancellationToken)
+        private static async Task<ProbeResult> SendProbeAsync(HttpClient client, string url, long from, long toInclusive,
+                                                              ParallelFetchOptions o, bool refuseWholeBody,
+                                                              CancellationToken cancellationToken)
         {
             int attempt = 0;
+            // -1 once we have fallen back to "bytes=<from>-".
+            long rangeEnd = toInclusive;
             // Open() blocks the caller for this whole thing, so the total is capped, not just
             // each attempt. Four attempts x one header timeout each would otherwise pin a host
             // request thread for over a minute.
@@ -292,7 +319,11 @@ namespace EmbyStrmParallel
                         double headerMs = Math.Min(o.ResponseHeadersTimeout.TotalMilliseconds, remainingMs);
                         probe.CancelAfter(TimeSpan.FromMilliseconds(headerMs));
                         HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Get, url);
-                        req.Headers.Range = new RangeHeaderValue(from, toInclusive);
+                        // A negative end emits "bytes=<from>-", the only form that cannot ask
+                        // for bytes past EOF when the size is still unknown.
+                        req.Headers.Range = rangeEnd < 0
+                            ? new RangeHeaderValue(from, null)
+                            : new RangeHeaderValue(from, rangeEnd);
                         // Pin the representation. Absent this a server is free to answer with an
                         // encoding we never asked for, and byte offsets into a re-encoded body
                         // point at the wrong media bytes.
@@ -315,6 +346,19 @@ namespace EmbyStrmParallel
                         probe.Dispose();
                     }
 
+                    if (response.StatusCode == HttpStatusCode.OK && rangeEnd >= 0)
+                    {
+                        // Overwhelmingly this means the bounded range ran past EOF and the origin
+                        // answered with the whole resource rather than clamping. Ask again the one
+                        // way that cannot overshoot. If THAT still comes back 200 the origin
+                        // genuinely does not do ranges, and the checks below decide what to do.
+                        try { response.Dispose(); } catch { }
+                        Log("probe re-asking open-ended url=" + FetchLog.Tail(url) + " from=" + from +
+                            " (bounded range " + from + "-" + rangeEnd + " was answered with the whole resource)");
+                        rangeEnd = -1;
+                        continue;   // deliberately not an attempt: this is a different question
+                    }
+
                     if (refuseWholeBody && response.StatusCode == HttpStatusCode.OK)
                     {
                         try { response.Dispose(); } catch { }
@@ -322,7 +366,8 @@ namespace EmbyStrmParallel
                                               from + " from it would mean discarding " + FetchLog.Size(from) + ".");
                     }
 
-                    if (!HttpRangeHelper.IsTransientStatus(response.StatusCode)) return response;
+                    if (!HttpRangeHelper.IsTransientStatus(response.StatusCode))
+                        return new ProbeResult { Response = response, OpenEnded = rangeEnd < 0 };
 
                     HttpStatusCode transient = response.StatusCode;
                     retryAfterMs = HttpRangeHelper.RetryAfterMs(response);
@@ -344,7 +389,8 @@ namespace EmbyStrmParallel
                     }
                     attempt++;
                     Log("probe retry " + attempt + "/" + (o.MaxAttempts - 1) + " url=" + FetchLog.Tail(url) +
-                        " range=" + from + "-" + toInclusive + " after " + FetchLog.Describe(ex));
+                        " range=" + from + "-" + (rangeEnd < 0 ? "(end)" : rangeEnd.ToString(CultureInfo.InvariantCulture)) +
+                        " after " + FetchLog.Describe(ex));
                     long backoff = Math.Min((long)o.RetryBaseDelayMs << Math.Min(attempt - 1, 20), o.RetryMaxDelayMs);
                     long delay = HttpRangeHelper.RetryDelayMs((int)backoff, retryAfterMs);
                     long left = deadline - Environment.TickCount64;

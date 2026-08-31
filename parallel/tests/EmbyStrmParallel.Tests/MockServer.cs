@@ -95,6 +95,13 @@ namespace EmbyStrmParallel.Tests
         /// <summary>Non-null = advertise this Content-Encoding (body is still identity; only the claim matters).</summary>
         internal string ContentEncoding;
 
+        /// <summary>
+        /// Answer a range whose last-byte-pos is past EOF with 200 + the whole resource, instead
+        /// of clamping it. RFC 7233 says to clamp; the production origin does this instead, and
+        /// it is the reason a tail read used to strand the fetcher discarding gigabytes.
+        /// </summary>
+        internal bool WholeFileWhenRangeEndsPastEof;
+
         /// <summary>Non-null = send this Retry-After value alongside a 503, and record the wait between attempts.</summary>
         internal string RetryAfter;
 
@@ -188,7 +195,9 @@ namespace EmbyStrmParallel.Tests
 
                 long from = 0;
                 long to = Size - 1;
-                bool hasRange = TryParseRange(ctx.Request.Headers["Range"], Size, ref from, ref to);
+                long rawTo = -1;
+                bool hasRange = TryParseRange(ctx.Request.Headers["Range"], Size, ref from, ref to, ref rawTo);
+                if (hasRange && WholeFileWhenRangeEndsPastEof && rawTo >= Size) hasRange = false;
 
                 MockFault fault = MockFault.None;
                 Func<int, long, long, MockFault> hook = FaultHook;
@@ -304,7 +313,7 @@ namespace EmbyStrmParallel.Tests
             }
         }
 
-        private static bool TryParseRange(string header, long size, ref long from, ref long to)
+        private static bool TryParseRange(string header, long size, ref long from, ref long to, ref long rawTo)
         {
             if (string.IsNullOrWhiteSpace(header)) return false;
             header = header.Trim();
@@ -319,6 +328,7 @@ namespace EmbyStrmParallel.Tests
             long t;
             if (b.Length == 0) t = size - 1;
             else if (!long.TryParse(b, NumberStyles.Integer, CultureInfo.InvariantCulture, out t)) return false;
+            rawTo = b.Length == 0 ? -1 : t;   // what the client literally asked for, before clamping
             if (t > size - 1) t = size - 1;
             if (f > t) return false;
             from = f;

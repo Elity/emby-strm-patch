@@ -256,7 +256,7 @@ There is only one way to know a new case is worth having: **remove the fix and c
 red.** All six were verified that way. Before the fix, the Content-Range case accepted 5 of 8
 malformed headers and delivered bytes from the wrong position for every one of them.
 
-### 8.2 Field data behind the "origin ignores Range" row
+### 8.2 Root cause: the probe asked for bytes past EOF
 
 Of 26 opens in one deployment's log, **3** took the `single-conn-fallback` path, and **every one
 of them was a tail read**:
@@ -270,15 +270,34 @@ That path serves a ranged request out of a 200 whole-resource body by reading an
 everything ahead of the offset — 10.48 GB downloaded to deliver 2083 bytes. **The delivered bytes
 are correct**, so nothing downstream can tell.
 
-Direct probing **could not reproduce it**: the same shapes (tail 2 KB, tail 637 KB) at offsets
-across the resource (0/25/50/75/90/99%), both against an idle origin and with 8 concurrent range
-downloads in flight, returned **21 clean 206s out of 21**. The root cause is therefore unknown —
-only that it is rare and clusters on tail reads.
+The first round of probing **could not reproduce it** — 21 clean 206s across offsets, idle and
+under load. **Because those probes clamped the range end to `SZ-1` and the production code does
+not**, which is exactly what hid the bug. Reproducing the real request shape made it deterministic:
 
-So the fix does not depend on the root cause: past `MaxIgnoredRangeSkipBytes` (64 MiB) the probe
-is retried — a 200 is worth one more attempt when direct probing says 206 twenty-one times out of
-twenty-one — and then declined, handing the request to the host. Small offsets still take the skip,
-which is the legitimate "this origin has no Range support at all" case.
+| request | result |
+|---|---|
+| `bytes=(EOF-83)-(EOF-83+1MiB-1)` — **end past EOF** | **200, whole file** |
+| `bytes=(EOF-83)-(EOF-1)` — clamped | 206 |
+| `bytes=(EOF-83)-` — open-ended | 206 |
+| `bytes=0-` — open-ended | 206 |
+
+**The bug is on our side.** The probe runs before the resource size is known, so with `length == 0`
+it guesses a span of `FirstChunkSize`, and any request starting within 1 MiB of the end overshoots
+— which is precisely the shape of a player's MKV index read. RFC 7233 says a server should clamp
+such a range; this origin returns the whole resource instead.
+
+Two layers of fix:
+
+1. **The probe sends a bounded range first and re-asks open-ended on a 200.** Open-ended cannot
+   overshoot by construction. Bounded stays first because an open-ended probe makes the origin
+   stream everything to EOF while only chunk 0 is consumed — irrelevant for a tail read, wasteful
+   for the whole-file request that dominates. The cost is one extra round trip on tail reads.
+2. Past `MaxIgnoredRangeSkipBytes` (64 MiB) a persistent 200 is declined and handed to the host.
+   Smaller offsets still take the skip, the legitimate "this origin has no Range support" case.
+
+**This test was nearly a tautology.** The first version asserted on the returned bytes — and the
+bytes were correct both before and after the fix. It only discriminates once it asserts how many
+bytes the origin was made to transfer (8 MiB versus ~0.5 MiB).
 
 `SkipLimitStream` also gained a closing log line. **The most expensive path in the component was
 the only one that logged nothing**, so there was no way to tell afterwards how long that 1.47 GB

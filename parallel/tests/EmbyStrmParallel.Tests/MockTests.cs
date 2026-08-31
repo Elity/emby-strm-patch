@@ -424,6 +424,7 @@ namespace EmbyStrmParallel.Tests
 
             await UntrustworthyContentRangeAsync(ct).ConfigureAwait(false);
             await UnknownTotalAsync(ct).ConfigureAwait(false);
+            await RangePastEofAsync(ct).ConfigureAwait(false);
             await IgnoredRangeSkipCeilingAsync(ct).ConfigureAwait(false);
             await ContentEncodingAsync(ct).ConfigureAwait(false);
             await RetryAfterAsync(ct).ConfigureAwait(false);
@@ -528,6 +529,78 @@ namespace EmbyStrmParallel.Tests
 
                     Harness.Assert(threw, "a resource that changed size mid-transfer was spliced together anyway");
                     return "version change detected via complete-length";
+                }
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// The probe runs before the resource size is known, so an "to the end of the resource"
+        /// request (length == 0) cannot name a last-byte-pos without risking one past EOF. A tail
+        /// read does exactly that: a player's MKV index read starts within a kilobyte of the end,
+        /// and asking for a full FirstChunkSize from there overshoots by ~1 MiB.
+        ///
+        /// RFC 7233 says a server should clamp such a range. The production origin answers 200
+        /// with the whole resource instead — measured, deterministic, and the cause of every
+        /// single-connection fallback in the field log. The fetcher used to then discard
+        /// gigabytes to deliver a few bytes; a 4 GB movie's 83-byte tail read cost 3810 MiB.
+        ///
+        /// The fix is to ask open-ended, which cannot overshoot by construction.
+        /// </summary>
+        private static async Task RangePastEofAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("tail read never asks for bytes past EOF", async () =>
+            {
+                using (MockServer srv = new MockServer(FileSize, fastContent: false))
+                {
+                    srv.WholeFileWhenRangeEndsPastEof = true;   // what the real origin does
+
+                    // Asserting on the returned bytes proves nothing here: the old code also
+                    // returned the right bytes. It got them by downloading the whole resource and
+                    // throwing away everything ahead of the offset, which is invisible from the
+                    // output and only shows up as bytes the origin had to serve.
+                    long overshoot = 0;
+
+                    long offset = FileSize - 83;
+                    srv.ResetCounters();
+                    Fetched got = await FetchAsync(srv.Url, offset, 0, Small(), ct).ConfigureAwait(false);
+                    Harness.AssertBytesEqual(Pattern.Range(offset, 83), got.Data, "tail bytes");
+                    Harness.AssertEqual(FileSize, got.Total.Value, "totalLength");
+                    Harness.AssertEqual(83, got.ContentLength.Value, "contentLength");
+                    // Not zero: the bounded probe still overshoots once, and the origin has
+                    // already queued some of the whole-file body before the retry aborts it. That
+                    // residual is bounded by socket buffers (here, a loopback HttpListener that
+                    // writes eagerly) — what must never happen is the WHOLE resource being paid
+                    // for, which is what the old code did.
+                    if (srv.BytesServed >= FileSize / 2) overshoot = srv.BytesServed;
+                    Harness.Assert(overshoot == 0,
+                        "origin had to serve " + overshoot + " of " + FileSize +
+                        " bytes to deliver 83; the probe asked past EOF and never re-asked");
+
+                    // A larger tail, and one starting exactly one steady chunk from the end.
+                    foreach (long want in new long[] { 637228, 1024 * 1024 })
+                    {
+                        long off2 = FileSize - want;
+                        srv.ResetCounters();
+                        Fetched f2 = await FetchAsync(srv.Url, off2, 0, Small(), ct).ConfigureAwait(false);
+                        Harness.AssertBytesEqual(Pattern.Range(off2, want), f2.Data, "tail " + want);
+                        Harness.AssertEqual(FileSize, f2.Total.Value, "totalLength for tail " + want);
+                        // The bounded probe overshoots EOF and is answered with the whole file,
+                        // so the retry re-asks open-ended. Cost is one extra round trip, not a
+                        // whole-resource download: anything near FileSize means the overshoot is
+                        // still being paid for.
+                        Harness.Assert(srv.BytesServed < FileSize / 2,
+                            "tail " + want + ": origin served " + srv.BytesServed + " bytes for a " + want + "-byte read");
+                    }
+
+                    // Control: the whole-resource case is open-ended too, and is the single most
+                    // common request there is. It must be untouched.
+                    srv.ResetCounters();
+                    Fetched whole = await FetchAsync(srv.Url, 0, 0, Small(), ct).ConfigureAwait(false);
+                    Harness.AssertEqual(FileSize, whole.Data.Length, "whole resource length");
+                    Harness.AssertBytesEqual(Pattern.Range(0, FileSize), whole.Data, "whole resource bytes");
+
+                    srv.WholeFileWhenRangeEndsPastEof = false;
+                    return "83B / 637KB / 1MiB tails cost no overshoot; whole file still exact";
                 }
             }).ConfigureAwait(false);
         }

@@ -91,6 +91,7 @@ namespace EmbyStrmParallel
                 HttpResponseMessage response = null;
                 CancellationTokenSource phase = null;
                 long retryAfterMs = -1;
+                bool fromProbe = false;
                 try
                 {
                     phase = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -99,6 +100,7 @@ namespace EmbyStrmParallel
                     {
                         response = pre;
                         pre = null; // consumed; only valid for the very first attempt of chunk 0
+                        fromProbe = true;
                     }
                     else
                     {
@@ -108,7 +110,7 @@ namespace EmbyStrmParallel
                     }
 
                     retryAfterMs = HttpRangeHelper.RetryAfterMs(response);
-                    ValidateResponse(response, cursor.Pos, endInclusive);
+                    ValidateResponse(response, cursor.Pos, endInclusive, fromProbe);
 
                     using (Stream body = await response.Content.ReadAsStreamAsync(phase.Token).ConfigureAwait(false))
                     {
@@ -179,7 +181,7 @@ namespace EmbyStrmParallel
         /// length from the wrong offset is invisible downstream, because the byte count still
         /// adds up and the stream still ends where it should.
         /// </summary>
-        private void ValidateResponse(HttpResponseMessage response, long expectedFrom, long expectedTo)
+        private void ValidateResponse(HttpResponseMessage response, long expectedFrom, long expectedTo, bool bodyMayRunLonger)
         {
             if (response.StatusCode != HttpStatusCode.PartialContent)
             {
@@ -207,7 +209,11 @@ namespace EmbyStrmParallel
             {
                 throw new IOException("Content-Range start " + from + " does not match requested " + expectedFrom + ".");
             }
-            if (to > expectedTo)
+            // The opening probe asks open-ended (see ParallelFetch: a bounded span would run
+            // past EOF near the tail, and this origin answers such a range with the whole file),
+            // so its body legitimately covers more than chunk 0. Reading stops at endInclusive
+            // either way, so the extra bytes are never consumed.
+            if (!bodyMayRunLonger && to > expectedTo)
             {
                 throw new IOException("Content-Range end " + to + " exceeds requested " + expectedTo + ".");
             }
