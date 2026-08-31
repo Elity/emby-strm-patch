@@ -92,8 +92,13 @@ namespace EmbyStrmParallel
         /// the throttling evidence points (the 502s come from the front layer). If a deployment
         /// ever shows the real ceiling is at the CDN instead, this decision has to be revisited.
         ///
-        /// Falls back to the whole string when the url will not parse, which keeps a malformed
-        /// url in its own group rather than merging it with everything else.
+        /// Falls back to the whole string when the url has no origin to speak of, which keeps it
+        /// in a group of its own rather than merging it with everything else. Parsing alone is
+        /// not enough of a test: on Unix a bare path like "/a/b.mkv" parses happily as
+        /// file:///a/b.mkv, so the authority check is what stops every path-shaped url in the
+        /// process from collapsing onto one key and throttling unrelated origins against each
+        /// other. Not reachable from the configured prefixes today - they are all http(s) - but
+        /// this is the fallback, and a fallback that quietly merges is worse than none.
         /// </summary>
         internal static string KeyFor(string url)
         {
@@ -101,6 +106,7 @@ namespace EmbyStrmParallel
             try
             {
                 Uri u = new Uri(url, UriKind.Absolute);
+                if (string.IsNullOrEmpty(u.Host)) return url;
                 return u.Scheme + "://" + u.Host + ":" + u.Port;
             }
             catch

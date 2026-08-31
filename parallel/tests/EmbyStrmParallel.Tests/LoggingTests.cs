@@ -362,6 +362,45 @@ namespace EmbyStrmParallel.Tests
                 }
             }).ConfigureAwait(false);
 
+            await Harness.RunAsync("the budget and its clamp are on the open line, rendered", async () =>
+            {
+                // "budget below connections clamps, LOGS, and still serves" asserted the flag and
+                // never the log. A flag nobody renders is not a diagnostic, and the clamp is
+                // precisely the case where an operator is looking at the line asking why they are
+                // not getting the connection count they configured.
+                string dir = NewTempDir();
+                string logPath = Path.Combine(dir, "parallel.log");
+                Arm(logPath);
+                try
+                {
+                    using (MockServer srv = new MockServer(4L * 1024 * 1024, fastContent: true))
+                    {
+                        OriginBudget.ResetForTests();
+                        ParallelFetchOptions o = Small();
+                        o.Connections = 6;
+                        o.MaxOriginConnections = 2;      // deliberately contradictory
+
+                        long? t, cl;
+                        using (Stream s = ParallelFetch.OpenWith(srv.Url, 0, 300000, o, out t, out cl, ct))
+                        {
+                            byte[] got = await Harness.ReadAllAsync(s, 32 * 1024, ct).ConfigureAwait(false);
+                            Harness.AssertBytesEqual(Pattern.Range(0, 300000), got, "bytes under a clamped config");
+                        }
+
+                        string text = File.ReadAllText(logPath);
+                        string open = null;
+                        foreach (string l in text.Trim().Split('\n')) if (l.Contains("open path=parallel")) open = l;
+                        Harness.Assert(open != null, "no open line at all: " + text);
+                        Harness.Assert(open.Contains("originBudget=2"),
+                            "the open line does not report the budget in force: " + open);
+                        Harness.Assert(open.Contains("conn=2(clamped by max-origin-connections=2)"),
+                            "the clamp is recorded in a flag but never rendered: " + open);
+                        return "conn=2(clamped by max-origin-connections=2) originBudget=2";
+                    }
+                }
+                finally { Disarm(); try { Directory.Delete(dir, true); } catch { } }
+            }).ConfigureAwait(false);
+
             await Harness.RunAsync("unwritable log path never breaks a request", async () =>
             {
                 // A path whose parent cannot be created: an existing *file* used as a directory.

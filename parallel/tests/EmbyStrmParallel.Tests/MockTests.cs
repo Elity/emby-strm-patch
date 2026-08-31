@@ -456,6 +456,7 @@ namespace EmbyStrmParallel.Tests
         {
             Harness.Section("origin connection budget");
 
+            await BudgetKeyGroupingAsync(ct).ConfigureAwait(false);
             await BudgetCapsConcurrencyAsync(ct).ConfigureAwait(false);
             await BudgetStarvesNoStreamAsync(ct).ConfigureAwait(false);
             await BudgetNeverLeaksPermitsAsync(ct).ConfigureAwait(false);
@@ -471,6 +472,101 @@ namespace EmbyStrmParallel.Tests
             await BudgetSurvivesAStalledReaderAsync(ct).ConfigureAwait(false);
             await BudgetFreedDuringBackoffAsync(ct).ConfigureAwait(false);
             await BudgetWithConnectionRampAsync(ct).ConfigureAwait(false);
+            await BudgetWakesQueuedWorkersOnDisposeAsync(ct).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// What counts as "the same origin". Every other budget test feeds this a well-formed
+        /// absolute url from the mock server, so the grouping rules and the malformed-url
+        /// fallback were decided by reading rather than by measurement.
+        ///
+        /// The fallback matters more than it looks: returning the whole string keeps an
+        /// unparseable url in a group of its own. Returning a constant instead would quietly
+        /// merge every broken url into one budget and throttle unrelated origins against each
+        /// other.
+        /// </summary>
+        private static async Task BudgetKeyGroupingAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("the grouping key is the authority, and never merges by accident", async () =>
+            {
+                string a = OriginBudget.KeyFor("https://pan.example.com/a/b.mkv?sign=x");
+                Harness.Assert(a == "https://pan.example.com:443",
+                    "authority key should carry the default port explicitly, got " + a);
+                Harness.Assert(OriginBudget.KeyFor("https://pan.example.com/other/path.mkv") == a,
+                    "two paths on one host must share a budget");
+                Harness.Assert(OriginBudget.KeyFor("https://PAN.example.com/a.mkv") == a,
+                    "host comparison must not be case-sensitive");
+                Harness.Assert(OriginBudget.KeyFor("https://pan.example.com:8443/a.mkv") != a,
+                    "a different port is a different origin");
+                Harness.Assert(OriginBudget.KeyFor("http://pan.example.com/a.mkv") != a,
+                    "a different scheme is a different origin");
+
+                // The catch branch. Each malformed url keeps its own group; none of them lands
+                // on a shared key that would throttle real origins.
+                string m1 = OriginBudget.KeyFor("not a url at all");
+                string m2 = OriginBudget.KeyFor("/relative/path.mkv");
+                Harness.Assert(m1 == "not a url at all", "malformed url should key on itself, got " + m1);
+                Harness.Assert(m2 == "/relative/path.mkv", "relative url should key on itself, got " + m2);
+                Harness.Assert(m1 != m2 && m1 != a && m2 != a, "malformed urls must not merge with each other or with a real origin");
+                Harness.AssertEqual(0, string.CompareOrdinal(OriginBudget.KeyFor(null), "(none)"), "null url");
+                Harness.AssertEqual(0, string.CompareOrdinal(OriginBudget.KeyFor(""), "(none)"), "empty url");
+
+                await Task.CompletedTask;
+                return "9 grouping cases, malformed urls stay in their own groups";
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// A stream thrown away while its workers are queued for a permit must let them go at
+        /// once. `TryAcquireAsync` takes the stream's token precisely so that a disposed stream
+        /// wakes its waiters instead of leaving tasks parked until a timeout - and until now
+        /// nothing checked it: the other teardown tests dispose streams whose workers are busy
+        /// or idle, never queued, because that state only exists when the budget is full.
+        ///
+        /// The stakes are that a leaked parked task also holds its slot, its channel and its
+        /// buffers, so a burst of seeks against a saturated origin would accumulate them.
+        /// </summary>
+        private static async Task BudgetWakesQueuedWorkersOnDisposeAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("disposing wakes workers queued on the budget at once", async () =>
+            {
+                using (MockServer srv = new MockServer(64L * 1024 * 1024, fastContent: true))
+                {
+                    srv.ThrottleBytesPerSec = 256 * 1024;
+                    OriginBudget.ResetForTests();
+                    string key = OriginBudget.KeyFor(srv.Url);
+
+                    ParallelFetchOptions o = Budgeted(connections: 4, budget: 4);
+                    // Leave exactly one permit: enough for the probe, so the stream opens and its
+                    // other workers have nowhere to go.
+                    List<OriginBudget.Permit> held = new List<OriginBudget.Permit>();
+                    for (int i = 0; i < 3; i++)
+                        held.Add(await OriginBudget.TryAcquireAsync(key, 4, TimeSpan.FromSeconds(2), ct).ConfigureAwait(false));
+                    Harness.Assert(held[2] != null, "could not tie up the budget");
+
+                    long? t, c;
+                    ParallelRangeStream s = (ParallelRangeStream)ParallelFetch.OpenWith(
+                        srv.Url, 0, 8 * 1024 * 1024, o, out t, out c, ct);
+                    byte[] buf = new byte[32 * 1024];
+                    await s.ReadAsync(buf.AsMemory(0, buf.Length), ct).ConfigureAwait(false);
+                    await Task.Delay(400, ct).ConfigureAwait(false);   // let the rest queue up
+
+                    Stopwatch sw = Stopwatch.StartNew();
+                    s.Dispose();
+                    await s.WorkersCompletion.WaitAsync(TimeSpan.FromSeconds(10), ct).ConfigureAwait(false);
+                    sw.Stop();
+
+                    Harness.Assert(sw.Elapsed.TotalSeconds < 2,
+                        "queued workers took " + sw.Elapsed.TotalSeconds.ToString("0.00") +
+                        "s to unwind; they were waiting out a timeout rather than the token");
+
+                    foreach (OriginBudget.Permit p in held) p.Dispose();
+                    for (int i = 0; i < 60 && OriginBudget.InUse(key) != 0; i++)
+                        await Task.Delay(50, ct).ConfigureAwait(false);
+                    Harness.AssertEqual(0, OriginBudget.InUse(key), "permits after teardown");
+                    return "queued workers gone in " + sw.Elapsed.TotalSeconds.ToString("0.00") + "s";
+                }
+            }).ConfigureAwait(false);
         }
 
         private static ParallelFetchOptions Budgeted(int connections, int budget)
