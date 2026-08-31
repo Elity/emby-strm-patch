@@ -248,6 +248,10 @@ namespace EmbyStrmParallel
                         " offset=" + offset + " length=" + effective +
                         " total=" + total.ToString(CultureInfo.InvariantCulture) +
                         " conn=" + o.Connections +
+                        (o.ConnectionsClampedByBudget
+                            ? "(clamped by max-origin-connections=" + o.MaxOriginConnections + ")"
+                            : "") +
+                        " originBudget=" + o.MaxOriginConnections +
                         " chunk=" + FetchLog.Size(o.ChunkSize) +
                         " firstChunk=" + FetchLog.Size(o.FirstChunkSize) +
                         " chunks=" + stream.ChunkCount +

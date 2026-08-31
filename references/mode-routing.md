@@ -101,6 +101,7 @@ a case that barely occurs — an install normally has at most one origin that ne
 | `chunk-mb` | 8 | `EMBY_STRM_CHUNK_MB` |
 | `buffer-mb` | 128 | `EMBY_STRM_BUFFER_MB` |
 | `initial-connections` | 2 | `EMBY_STRM_INITIAL_CONNECTIONS` |
+| `max-origin-connections` | 12 | `EMBY_STRM_MAX_ORIGIN_CONNECTIONS` |
 | `log` | off | `EMBY_STRM_LOG` |
 
 #### How to tune these
@@ -125,17 +126,27 @@ is written per stream at close, and it carries all three numbers you need:
 
 Tune in this order, one setting at a time:
 
-1. **`connections`** — the one that matters. Lower it while `slow > 0`; raise it if `rate` is
-   below what the source needs *and* `slow` is still 0.
-   ⚠️ **It is a per-STREAM limit, while the origin limits the total it sees.** A seek makes two
-   streams overlap — the abandoned one's connections are not released at the origin
-   immediately — so the origin briefly sees roughly **twice** this number. Measured: 8 → ~16 at
-   the origin → collapse (every connection down to ~33 KB/s, 15 slow-retries, playback errored);
-   6 → ~12 → a 732 s continuous read at 15.64 Mbps with zero slow events.
-2. **`ramp-seconds`** — only if startup is slow; see the sweep in §7. **1 is a cliff**, do not
+1. **`max-origin-connections`** — how many requests one origin can take at once, **across every
+   stream**. This is the number that actually describes the origin, so reach for it first when
+   `slow > 0`. It is grouped per authority, so two different providers each get their own quota
+   and never contend.
+2. **`connections`** — one stream's parallelism. It is a per-STREAM ceiling while
+   `max-origin-connections` is the gate on the total; they govern different things. Raise it if
+   `rate` is below what the source needs *and* `slow` is still 0.
+   ⚠️ Setting `connections > max-origin-connections` is a contradiction: one stream would take
+   the entire quota and a second would starve. The fetcher lowers `connections` to the budget and
+   says so on the stream's open line, and `embypatch check` reports the pair before playback.
+3. **`ramp-seconds`** — only if startup is slow; see the sweep in §7. **1 is a cliff**, do not
    go looking.
-3. **`chunk-mb` / `buffer-mb`** — rarely worth touching. The memory ceiling is
+4. **`chunk-mb` / `buffer-mb`** — rarely worth touching. The memory ceiling is
    `slots × chunk-mb`, and `slots ≤ connections + 4`.
+
+**Why a budget rather than just tuning `connections`:** the safe value of `connections` depends on
+how many streams happen to be open, which is a function of how the user seeks — not something the
+server controls. Lowering it to 6 worked only because "at most two streams overlap" happened to be
+true, and that assumption lived nowhere except in the number itself. Three viewers, or a burst of
+seeks, is 18 or 24 again. The budget puts the limit where the constraint actually is, so a single
+stream still runs flat out, several queue, and nothing crosses the cliff.
 
 **Do not guess — verify from the log.** A config edit is live within 30 s: play something, seek a
 few times, then read `slow=` and `rate=`.
@@ -375,14 +386,16 @@ close to impossible to diagnose from symptoms alone.
 Unlike the list above, these are real. They are recorded here so the next person to find them
 does not have to re-derive the reasoning:
 
-- **Cross-stream connection and memory budgets.** One connection pool per stream is a measured,
-  deliberate choice: a shared pool let an abandoned stream poison the next one
-  (25.14 → 2.58 → 0.57 → 0.15 Mbps, while curl on fresh connections was healthy at the same
-  instant). So any global budget **must not reintroduce a shared pool**. `FetchMetrics` is
-  already a process-wide buffered-byte counter; what is missing is admission control, not
-  observability. Two default streams add up to 16 connections, which is past the 503 cliff
-  measured on the reference origin — though that specific collision has not been demonstrated
-  with a two-stream experiment.
+- ~~Cross-stream connection budget~~ — **done**, see `parallel/src/OriginBudget.cs` and §3.3. A
+  semaphore grouped by authority, acquired and released per worker. What is shared is a count,
+  never a connection pool; pools remain strictly per stream, for the reason recorded in
+  `HttpClientHolder`.
+  The related gap still open is a **cross-stream memory budget**: `FetchMetrics` is already a
+  process-wide buffered-byte counter, but nothing admits or queues on it, so N streams still cost
+  N × `slots × chunk-mb`.
+- **Per-prefix budget values.** Today one global value is applied to each authority separately,
+  which already covers "two providers must not contend". Only "provider A tolerates 20 while B
+  tolerates 12" needs per-prefix values, and that wants a second origin's measurements first.
 - **The probe blocks a host request thread** for up to the stall budget (30s). This follows from
   the injection point: patch C returns `Task.FromResult` before the async state machine starts,
   so making the probe asynchronous means injecting a continuation. Not a small change.

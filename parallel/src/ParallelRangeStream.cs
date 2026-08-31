@@ -44,6 +44,9 @@ namespace EmbyStrmParallel
         private readonly StreamStats _stats = new StreamStats();
         private HttpClient _client;   // owned: this stream's private connection pool
 
+        private readonly string _originKey;
+        private long _permitWaitMs;      // summed across workers, for the closing log line
+
         private readonly long _rangeStart;
         private readonly long _totalToRead;
         private readonly long _chunkCount;
@@ -83,6 +86,7 @@ namespace EmbyStrmParallel
             StreamId = Interlocked.Increment(ref _nextStreamId);
             _tag = "#" + StreamId;
 
+            _originKey = OriginBudget.KeyFor(url);
             _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             _downloader = new ChunkDownloader(client, url, options, _tag, _stats, resourceTotal);
 
@@ -115,6 +119,17 @@ namespace EmbyStrmParallel
 
         private async Task WorkerLoopAsync(int workerIndex)
         {
+            // One permit per worker, held for the worker's whole life.
+            //
+            // Per-request permits would be more precise, but the probe response is HANDED OVER
+            // to become chunk 0's pre-opened body, so a request-scoped permit would have to
+            // change owner across objects and be returned correctly on all of the success,
+            // failure, cancellation and degrade paths. Leaking one there freezes playback
+            // forever with no error - the single worst failure this component can have. A worker
+            // is already ~one concurrent connection and has one obvious exit, so the permit has
+            // exactly one release site. A worker parked on a full channel still holds its permit;
+            // that is conservative in the safe direction.
+            OriginBudget.Permit permit = null;
             try
             {
                 // Connection slow-start: workers past InitialConnections join gradually, so a
@@ -125,6 +140,13 @@ namespace EmbyStrmParallel
                     await Task.Delay(TimeSpan.FromTicks(_o.ConnectionRampInterval.Ticks * steps), _cts.Token)
                               .ConfigureAwait(false);
                 }
+
+                // After the ramp, so a worker that will not run for another 6 seconds is not
+                // sitting on a permit some other stream could be using right now.
+                long waitStart = Environment.TickCount64;
+                permit = await OriginBudget.AcquireAsync(_originKey, _o.MaxOriginConnections, _cts.Token)
+                                           .ConfigureAwait(false);
+                Interlocked.Add(ref _permitWaitMs, Environment.TickCount64 - waitStart);
 
                 while (true)
                 {
@@ -199,6 +221,12 @@ namespace EmbyStrmParallel
                 Interlocked.CompareExchange(ref _fatal, ex, null);
                 FetchLog.Write(_tag + " worker aborted: " + FetchLog.Describe(ex));
                 try { _cts.Cancel(); } catch { }
+            }
+            finally
+            {
+                // The single release site. Every exit above - normal, cancelled, faulted -
+                // funnels through here, which is the whole reason the permit is worker-scoped.
+                if (permit != null) permit.Dispose();
             }
         }
 
@@ -495,6 +523,7 @@ namespace EmbyStrmParallel
                            " rate=" + mbps.ToString("0.00", CultureInfo.InvariantCulture) + "Mbps" +
                            " chunks=" + _stats.ChunksCompleted + "/" + _chunkCount +
                            " retries=" + _stats.Retries + " (slow=" + _stats.SlowRetries + ")" +
+                           " permitWait=" + (Volatile.Read(ref _permitWaitMs) / 1000.0).ToString("0.0", CultureInfo.InvariantCulture) + "s" +
                            (_fault != null ? " fault=" + _fault.GetType().Name : ""));
         }
 

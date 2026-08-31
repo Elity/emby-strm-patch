@@ -440,6 +440,258 @@ namespace EmbyStrmParallel.Tests
             await CancellationAsync(ct).ConfigureAwait(false);
             await DisposeMidStreamAsync(ct).ConfigureAwait(false);
             await WorkerStartupFailureAsync(ct).ConfigureAwait(false);
+
+            Harness.Section("origin connection budget");
+
+            await BudgetCapsConcurrencyAsync(ct).ConfigureAwait(false);
+            await BudgetNeverLeaksPermitsAsync(ct).ConfigureAwait(false);
+            await BudgetIsPerOriginAsync(ct).ConfigureAwait(false);
+            await BudgetReleasedOnDisposeAsync(ct).ConfigureAwait(false);
+            await BudgetBelowConnectionsAsync(ct).ConfigureAwait(false);
+        }
+
+        private static ParallelFetchOptions Budgeted(int connections, int budget)
+        {
+            ParallelFetchOptions o = Small();
+            o.Connections = connections;
+            o.MaxOriginConnections = budget;
+            o.MaxBufferBytes = 64L * 64 * 1024;   // room for connections + 4 slots
+            return o;
+        }
+
+        /// <summary>Opens a stream and reads it slowly in the background until cancelled.</summary>
+        private static Task RunUntilCancelledAsync(string url, ParallelFetchOptions o, CancellationToken ct)
+        {
+            return Task.Run(async () =>
+            {
+                try
+                {
+                    long? t, c;
+                    using (Stream s = ParallelFetch.OpenWith(url, 0, 0, o, out t, out c, ct))
+                    {
+                        await Harness.DrainAsync(s, 32 * 1024, 1, ct, null).ConfigureAwait(false);
+                    }
+                }
+                catch { /* cancellation and origin faults are the point of these tests */ }
+            });
+        }
+
+        /// <summary>
+        /// The whole reason this exists: `Connections` is per stream, the origin limits the total.
+        /// Four streams at 6 connections each want 24 at the origin; the budget must hold it to 12.
+        /// </summary>
+        private static async Task BudgetCapsConcurrencyAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("N streams cannot exceed the origin budget between them", async () =>
+            {
+                using (MockServer srv = new MockServer(256L * 1024 * 1024, fastContent: true))
+                {
+                    srv.ThrottleBytesPerSec = 512 * 1024;   // keep requests open long enough to overlap
+                    OriginBudget.ResetForTests();
+                    string key = OriginBudget.KeyFor(srv.Url);
+
+                    ParallelFetchOptions o = Budgeted(connections: 6, budget: 12);
+                    using (CancellationTokenSource run = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                    {
+                        Task[] streams = new Task[4];
+                        for (int i = 0; i < streams.Length; i++) streams[i] = RunUntilCancelledAsync(srv.Url, o, run.Token);
+                        await Task.Delay(4000, ct).ConfigureAwait(false);
+
+                        int peakPermits = OriginBudget.Peak(key);
+                        int peakAtOrigin = srv.MaxConcurrent;
+                        run.Cancel();
+                        await Task.WhenAll(streams).ConfigureAwait(false);
+
+                        Harness.Assert(peakPermits <= 12,
+                            "permits peaked at " + peakPermits + ", budget was 12");
+                        // The probe deliberately takes no permit (it runs on a host request
+                        // thread and must never block), so the origin can briefly see one extra
+                        // per stream on top of the budget.
+                        Harness.Assert(peakAtOrigin <= 12 + streams.Length,
+                            "origin saw " + peakAtOrigin + " concurrent; budget 12 + " + streams.Length + " probes");
+                        // Dispose deliberately does not block on worker unwind (it can run on a
+                        // host request thread), so permits come back a moment later. Promptness
+                        // is asserted separately in "abandoning a stream returns its permits at
+                        // once"; here we only need them all back eventually.
+                        for (int i = 0; i < 60 && OriginBudget.InUse(key) != 0; i++)
+                            await Task.Delay(50, ct).ConfigureAwait(false);
+                        Harness.AssertEqual(0, OriginBudget.InUse(key), "permits still held after teardown");
+                        return "4 streams x 6 conn -> permits peaked " + peakPermits + ", origin saw " + peakAtOrigin;
+                    }
+                }
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// The failure mode that matters most. A permit leaked once is never returned, and the
+        /// next stream waits on it forever: playback freezes with no error and no fallback. So
+        /// every exit path a worker has - clean finish, origin fault, throughput floor, mid-read
+        /// dispose, cancellation - has to end with the permit back.
+        /// </summary>
+        private static async Task BudgetNeverLeaksPermitsAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("permits return to zero through every failure path", async () =>
+            {
+                using (MockServer srv = new MockServer(64L * 1024 * 1024, fastContent: true))
+                {
+                    OriginBudget.ResetForTests();
+                    string key = OriginBudget.KeyFor(srv.Url);
+                    srv.ThrottleBytesPerSec = 1024 * 1024;
+                    srv.TrickleBytesPerSec = 1024;
+
+                    // Rotate through every fault the origin can produce, plus none at all.
+                    MockFault[] faults =
+                    {
+                        MockFault.None, MockFault.Status403, MockFault.Status500,
+                        MockFault.Status503RetryAfter, MockFault.TruncateHalf, MockFault.Trickle
+                    };
+                    int seqOffset = 0;
+                    srv.FaultHook = (seq, f, t) => faults[(seq + seqOffset) % faults.Length];
+
+                    ParallelFetchOptions o = Budgeted(connections: 4, budget: 8);
+                    o.MaxAttempts = 2;
+                    o.MinThroughputGrace = TimeSpan.FromMilliseconds(300);
+                    o.StallBudget = TimeSpan.FromSeconds(6);
+
+                    try
+                    {
+                        for (int round = 0; round < 3; round++)
+                        {
+                            seqOffset = round;
+                            using (CancellationTokenSource run = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                            {
+                                Task[] streams = new Task[3];
+                                for (int i = 0; i < streams.Length; i++)
+                                    streams[i] = RunUntilCancelledAsync(srv.Url, o, run.Token);
+                                // Cancel mid-flight: dispose racing an in-progress read is its own path.
+                                await Task.Delay(700 + round * 400, ct).ConfigureAwait(false);
+                                run.Cancel();
+                                await Task.WhenAll(streams).ConfigureAwait(false);
+                            }
+                        }
+                    }
+                    finally { srv.FaultHook = null; }
+
+                    // Workers unwind asynchronously after Dispose returns, so allow a moment -
+                    // but only a moment. A leak does not resolve with time.
+                    for (int i = 0; i < 50 && OriginBudget.InUse(key) != 0; i++)
+                        await Task.Delay(100, ct).ConfigureAwait(false);
+
+                    Harness.AssertEqual(0, OriginBudget.InUse(key),
+                        "permits still held after 9 streams x 6 fault kinds all finished");
+
+                    // Control: the budget still WORKS afterwards, i.e. we did not just release
+                    // everything into a broken gate.
+                    Fetched got = await FetchAsync(srv.Url, 0, 200000, Budgeted(4, 8), ct).ConfigureAwait(false);
+                    Harness.AssertBytesEqual(Pattern.Range(0, 200000), got.Data, "bytes after the storm");
+                    return "9 streams through 6 fault kinds, permits back to 0";
+                }
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Two origins must not share a quota. A slow or saturated one has to leave an unrelated
+        /// one completely alone - the reason the budget is keyed by authority rather than being
+        /// one number for the whole process.
+        /// </summary>
+        private static async Task BudgetIsPerOriginAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("saturating one origin does not touch another", async () =>
+            {
+                using (MockServer a = new MockServer(256L * 1024 * 1024, fastContent: true))
+                using (MockServer b = new MockServer(16L * 1024 * 1024, fastContent: true))
+                {
+                    a.ThrottleBytesPerSec = 256 * 1024;     // hold A's permits for a long time
+                    OriginBudget.ResetForTests();
+
+                    ParallelFetchOptions o = Budgeted(connections: 4, budget: 4);   // A saturated by one stream
+                    using (CancellationTokenSource run = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                    {
+                        Task[] hogs = new Task[3];
+                        for (int i = 0; i < hogs.Length; i++) hogs[i] = RunUntilCancelledAsync(a.Url, o, run.Token);
+                        await Task.Delay(1500, ct).ConfigureAwait(false);
+
+                        Harness.Assert(OriginBudget.InUse(OriginBudget.KeyFor(a.Url)) > 0,
+                            "origin A should be holding permits by now");
+
+                        // B must be served promptly despite A being fully subscribed.
+                        Stopwatch sw = Stopwatch.StartNew();
+                        Fetched got = await FetchAsync(b.Url, 0, 1024 * 1024, Budgeted(4, 4), ct).ConfigureAwait(false);
+                        sw.Stop();
+
+                        run.Cancel();
+                        await Task.WhenAll(hogs).ConfigureAwait(false);
+
+                        Harness.AssertBytesEqual(Pattern.Range(0, 1024 * 1024), got.Data, "origin B bytes");
+                        Harness.Assert(sw.Elapsed.TotalSeconds < 10,
+                            "origin B took " + sw.Elapsed.TotalSeconds.ToString("0.0") + "s while A was saturated");
+                        return "A saturated, B served in " + sw.Elapsed.TotalSeconds.ToString("0.0") + "s";
+                    }
+                }
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// A seek abandons a stream and opens another immediately. If the permits did not come
+        /// back at once, the new stream would queue behind a stream nobody is reading - which is
+        /// the stall this whole feature exists to prevent.
+        /// </summary>
+        private static async Task BudgetReleasedOnDisposeAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("abandoning a stream returns its permits at once", async () =>
+            {
+                using (MockServer srv = new MockServer(64L * 1024 * 1024, fastContent: true))
+                {
+                    srv.ThrottleBytesPerSec = 512 * 1024;
+                    OriginBudget.ResetForTests();
+                    string key = OriginBudget.KeyFor(srv.Url);
+                    ParallelFetchOptions o = Budgeted(connections: 4, budget: 4);
+
+                    long? t, c;
+                    Stream s = ParallelFetch.OpenWith(srv.Url, 0, 0, o, out t, out c, ct);
+                    byte[] buf = new byte[32 * 1024];
+                    await s.ReadAsync(buf.AsMemory(0, buf.Length), ct).ConfigureAwait(false);
+                    Harness.Assert(OriginBudget.InUse(key) > 0, "expected permits to be held while reading");
+
+                    Stopwatch sw = Stopwatch.StartNew();
+                    s.Dispose();
+                    for (int i = 0; i < 50 && OriginBudget.InUse(key) != 0; i++)
+                        await Task.Delay(20, ct).ConfigureAwait(false);
+                    sw.Stop();
+
+                    Harness.AssertEqual(0, OriginBudget.InUse(key), "permits after dispose");
+                    Harness.Assert(sw.Elapsed.TotalSeconds < 2,
+                        "took " + sw.Elapsed.TotalSeconds.ToString("0.00") + "s to give the permits back");
+                    return "returned in " + sw.Elapsed.TotalSeconds.ToString("0.00") + "s";
+                }
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Two independent settings can be configured into contradiction. A budget below the
+        /// per-stream count must degrade to something coherent and say so - not deadlock, and not
+        /// silently ignore one of the two numbers.
+        /// </summary>
+        private static async Task BudgetBelowConnectionsAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("budget below connections clamps, logs, and still serves", async () =>
+            {
+                using (MockServer srv = new MockServer(8L * 1024 * 1024, fastContent: false))
+                {
+                    OriginBudget.ResetForTests();
+                    ParallelFetchOptions raw = Budgeted(connections: 6, budget: 2);
+                    ParallelFetchOptions eff = raw.Normalize();
+
+                    Harness.AssertEqual(2, eff.Connections, "Connections after clamping to the budget");
+                    Harness.Assert(eff.ConnectionsClampedByBudget, "the clamp must be recorded so the log can report it");
+
+                    // Degrading is not the same as breaking: it still has to deliver exact bytes.
+                    Fetched got = await FetchAsync(srv.Url, 1000, 500000, raw, ct).ConfigureAwait(false);
+                    Harness.AssertBytesEqual(Pattern.Range(1000, 500000), got.Data, "bytes under a clamped config");
+                    Harness.AssertEqual(0, OriginBudget.InUse(OriginBudget.KeyFor(srv.Url)), "permits after");
+                    return "connections 6 -> 2, bytes still exact";
+                }
+            }).ConfigureAwait(false);
         }
 
         /// <summary>

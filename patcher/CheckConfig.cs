@@ -38,12 +38,13 @@ internal static class CheckConfig
     {
         return new[]
         {
-            ("ramp-seconds",        "6"),
-            ("connections",         "8"),
-            ("chunk-mb",            "8"),
-            ("buffer-mb",           "128"),
-            ("initial-connections", "2"),
-            ("log",                 "(off)"),
+            ("ramp-seconds",           "6"),
+            ("connections",            "6"),
+            ("chunk-mb",               "8"),
+            ("buffer-mb",              "128"),
+            ("initial-connections",    "2"),
+            ("max-origin-connections", "12"),
+            ("log",                    "(off)"),
         };
     }
 
@@ -168,11 +169,11 @@ internal static class CheckConfig
                     errors.Add($"route #{n} ({mode}) {prefix}: {why}");
                 }
 
-                // mode-routing.md §9. strm files hold percent-encoded URLs and Emby stores them
-                // verbatim in MediaSourceInfo.Path — confirmed by inspecting a live item, not
-                // assumed. Matching is a literal StartsWith, so a prefix typed in its decoded
-                // form can never match — and the miss is completely silent. This warning is the
-                // only thing standing between a user and an unfindable fault.
+                // mode-routing.md §9. strm files hold percent-encoded URLs and Emby stores them verbatim
+                // in MediaSourceInfo.Path (measured on item 5409368, 2026-08-31). Matching is a
+                // literal StartsWith, so a prefix typed in its decoded form can never match — and
+                // the miss is completely silent. This warning is the only thing standing between a
+                // user and an unfindable fault.
                 string nonAscii = NonAsciiSample(prefix);
                 if (nonAscii != null)
                 {
@@ -199,7 +200,23 @@ internal static class CheckConfig
             string source = StrmDirect.GetSettingSource(s.Key);
             if (source == null) { value = s.Default; source = "default"; }
             else if (source == "env" && exports.ContainsKey(EnvNameOf(s.Key))) source = "bin/emby-server";
-            Console.WriteLine($"   {s.Key,-21} {value,-30} {source}");
+            Console.WriteLine($"   {s.Key,-24} {value,-30} {source}");
+        }
+
+        // A cross-setting contradiction, which no single-key check can see. `connections` is a
+        // per-stream count and `max-origin-connections` is the cap across every stream, so a
+        // budget below the per-stream count means one stream takes the whole origin's quota and
+        // a second one starves until the first ends. The fetcher degrades by lowering
+        // `connections`, but that is worth saying out loud HERE - before anything is played -
+        // rather than leaving it to be noticed in a log line during playback.
+        int perStream = SettingAsInt("connections", 6);
+        int budget    = SettingAsInt("max-origin-connections", 12);
+        if (perStream > budget)
+        {
+            warns.Add($"connections ({perStream}) exceeds max-origin-connections ({budget}); " +
+                      $"the fetcher will lower connections to {budget}. The budget is the cap across ALL " +
+                      "streams, so a value below the per-stream count leaves no room for a second stream " +
+                      "(which is exactly what a seek creates).");
         }
 
         // Unknown setting keys used to be caught here, against a list this file kept of its own.
@@ -381,9 +398,8 @@ internal static class CheckConfig
 
     private static void Rung(int n, string what, string value, bool winner, ref bool taken)
     {
-        // First hit wins, and only the first is marked. In several common packaging layouts
-        // layers 3 and 5 legitimately resolve to the same file, and two arrows would read as
-        // two separate sources.
+        // First hit wins, and only the first is marked. Layers 3 and 5 legitimately resolve to
+        // the same file, and two arrows would read as two separate sources.
         bool mark = winner && !taken;
         if (mark) taken = true;
         Console.WriteLine($"  {(mark ? "=>" : "  ")} {n} {what,-24} {(value == null ? "unset" : value)}");
@@ -427,10 +443,19 @@ internal static class CheckConfig
         return result;
     }
 
+    /// <summary>A setting as a number, falling back to the built-in default when unset or unparseable.</summary>
+    private static int SettingAsInt(string key, int fallback)
+    {
+        string raw = StrmDirect.GetSetting(key);
+        int v;
+        return !string.IsNullOrWhiteSpace(raw) && int.TryParse(raw.Trim(), out v) && v > 0 ? v : fallback;
+    }
+
     private static string EnvNameOf(string key)
     {
         if (key == "ramp-seconds")        return "EMBY_STRM_RAMP_SECONDS";
         if (key == "connections")         return "EMBY_STRM_CONNECTIONS";
+        if (key == "max-origin-connections") return "EMBY_STRM_MAX_ORIGIN_CONNECTIONS";
         if (key == "chunk-mb")            return "EMBY_STRM_CHUNK_MB";
         if (key == "buffer-mb")           return "EMBY_STRM_BUFFER_MB";
         if (key == "initial-connections") return "EMBY_STRM_INITIAL_CONNECTIONS";

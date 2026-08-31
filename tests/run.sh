@@ -124,6 +124,14 @@ check_case "decoded (non-ASCII) prefix raises the percent-encoding warning" 0 "n
 printf 'chunck-mb = 16\n' > "$CFG"
 check_case "misspelled setting key is not silently ignored" 1 "unknown setting 'chunck-mb'"
 
+# A contradiction no single-key check can see: the budget is the cap across ALL streams, so a
+# value below the per-stream count leaves no room for the second stream a seek creates.
+printf 'https://plain.example/\nconnections = 8\nmax-origin-connections = 4\n' > "$CFG"
+check_case "connections above max-origin-connections is warned about" 0 "exceeds max-origin-connections"
+
+printf 'https://plain.example/\nconnections = 6\nmax-origin-connections = 12\n' > "$CFG"
+check_case "a coherent pair produces no such warning" 0 "OK   1 route(s), 0 warning(s)"
+
 [ "$CHECK_FAIL" = 0 ] || exit 1
 
 echo

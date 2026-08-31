@@ -315,7 +315,8 @@ namespace EmbyStrmParallel.Tests
                     WriteConfig(dir, "ramp-seconds = 2\n");
                     ParallelFetchOptions o = ParallelFetchOptions.FromConfiguration();
                     Harness.AssertEqual(2, (long)o.ConnectionRampInterval.TotalSeconds, "ramp-seconds");
-                    Harness.AssertEqual(8, o.Connections, "connections should still be the default");
+                    Harness.AssertEqual(6, o.Connections, "connections should still be the default");
+                    Harness.AssertEqual(12, o.MaxOriginConnections, "max-origin-connections should still be the default");
                     Harness.AssertEqual(8L * 1024 * 1024, o.ChunkSize, "chunk-mb should still be the default");
                     await Task.CompletedTask;
                     return "file wins where set, default elsewhere";

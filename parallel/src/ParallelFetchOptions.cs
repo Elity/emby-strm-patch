@@ -180,6 +180,20 @@ namespace EmbyStrmParallel
         public TimeSpan MinThroughputGrace { get; set; } = TimeSpan.FromSeconds(6);
 
         /// <summary>
+        /// Cap on range requests in flight against ONE origin, across every stream in the
+        /// process. See OriginBudget for why the limit belongs here rather than on the stream.
+        ///
+        /// 12 is measured: the single-stream sweep above shows 12 concurrent requests are still
+        /// healthy (42.5 Mbps) while 16 is a cliff (persistent 503). It is also exactly
+        /// Connections x 2, i.e. "two streams can run flat out" — which is the shape a seek
+        /// creates, and the case that used to break.
+        /// </summary>
+        public int MaxOriginConnections { get; set; } = 12;
+
+        /// <summary>True when Normalize() had to lower Connections to fit the budget.</summary>
+        internal bool ConnectionsClampedByBudget { get; private set; }
+
+        /// <summary>
         /// How far the degraded "origin ignored Range" path may skip before it is refused.
         ///
         /// That path answers a ranged request from a 200 whole-resource body by reading and
@@ -212,6 +226,20 @@ namespace EmbyStrmParallel
             o.ChunkSize = Clamp(o.ChunkSize, o.BlockSize, 256 * 1024 * 1024);
             o.FirstChunkSize = Clamp(o.FirstChunkSize, o.BlockSize, o.ChunkSize);
             o.Connections = Clamp(o.Connections, 1, MaxConnections);
+            o.MaxOriginConnections = Clamp(o.MaxOriginConnections, 1, MaxConnections);
+
+            // Two independent settings can be configured into contradiction. A budget below the
+            // per-stream count means one stream takes the whole origin's quota and every later
+            // worker waits out the stream's lifetime, while a second stream starves completely.
+            // Lower Connections rather than raise the budget: the budget describes what the
+            // ORIGIN can take, which is the more authoritative of the two. Never silent — the
+            // effective value and the reason are printed on the stream's open line, and
+            // `embypatch check` reports the combination before anything is ever played.
+            if (o.Connections > o.MaxOriginConnections)
+            {
+                o.Connections = o.MaxOriginConnections;
+                o.ConnectionsClampedByBudget = true;
+            }
             o.MaxAttempts = Clamp(o.MaxAttempts, 1, 16);
             o.RetryBaseDelayMs = Clamp(o.RetryBaseDelayMs, 0, 10000);
             o.RetryMaxDelayMs = Clamp(o.RetryMaxDelayMs, o.RetryBaseDelayMs, 60000);
@@ -290,6 +318,7 @@ namespace EmbyStrmParallel
                 if (TrySetting("chunk-mb", out n)) o.ChunkSize = (int)(Math.Min(n, MaxChunkMiB) * 1024 * 1024);
                 if (TrySetting("buffer-mb", out n)) o.MaxBufferBytes = Math.Min(n, MaxBufferMiB) * 1024 * 1024;
                 if (TrySetting("initial-connections", out n)) o.InitialConnections = (int)Math.Min(n, MaxConnections);
+                if (TrySetting("max-origin-connections", out n)) o.MaxOriginConnections = (int)Math.Min(n, MaxConnections);
                 if (TrySetting("ramp-seconds", out n)) o.ConnectionRampInterval = TimeSpan.FromSeconds(Math.Min(n, MaxRampSeconds));
             }
             catch

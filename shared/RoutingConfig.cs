@@ -233,6 +233,7 @@ internal static class StrmDirect
         if (string.Equals(key, "chunk-mb", StringComparison.Ordinal)) return "EMBY_STRM_CHUNK_MB";
         if (string.Equals(key, "buffer-mb", StringComparison.Ordinal)) return "EMBY_STRM_BUFFER_MB";
         if (string.Equals(key, "initial-connections", StringComparison.Ordinal)) return "EMBY_STRM_INITIAL_CONNECTIONS";
+        if (string.Equals(key, "max-origin-connections", StringComparison.Ordinal)) return "EMBY_STRM_MAX_ORIGIN_CONNECTIONS";
         if (string.Equals(key, "log", StringComparison.Ordinal)) return "EMBY_STRM_LOG";
         return null;
     }
@@ -240,7 +241,7 @@ internal static class StrmDirect
     // Only ever rendered into an error message; EnvNameFor above is what actually decides.
     // Keep the two in step.
     private const string KnownSettingKeys =
-        "ramp-seconds, connections, chunk-mb, buffer-mb, initial-connections, log";
+        "ramp-seconds, connections, chunk-mb, buffer-mb, initial-connections, max-origin-connections, log";
 
     /// <summary>
     /// Reads and parses, at most once every CacheMillis. Deliberately lock-free: the parse is
