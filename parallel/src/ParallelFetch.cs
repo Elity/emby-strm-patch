@@ -155,7 +155,7 @@ namespace EmbyStrmParallel
             // whole recovery. Making TryOpen genuinely async is not a small change - the injected
             // call site returns before any state machine starts - and is tracked in
             // mode-routing.md 11.1 alongside the same limitation for the probe itself.
-            long openDeadline = Environment.TickCount64 + (long)o.StallBudget.TotalMilliseconds;
+            long openDeadline = Environment.TickCount64 + ProbeBudgetMs(o);
 
             // The probe IS chunk 0, so it needs a permit like any other request. Taking it here
             // rather than inside the stream is what keeps a queued stream from sitting on a live
@@ -168,38 +168,16 @@ namespace EmbyStrmParallel
             // path already exists, is correct, and is the right answer when the origin has no
             // capacity left to give.
             //
-            // The wait gets the shared deadline MINUS one full header timeout, so a permit won
-            // at the last moment is still a permit the probe has time to use. Spending all of it
-            // queuing would mean taking a slot and then immediately failing the request it was
-            // taken for - the worst of both outcomes.
             string originKey = OriginBudget.KeyFor(url);
-            long permitBudgetMs = openDeadline - Environment.TickCount64 -
-                                  (long)o.ResponseHeadersTimeout.TotalMilliseconds;
-            if (permitBudgetMs < 1) permitBudgetMs = 1;
-            long permitWaitStart = Environment.TickCount64;
-            OriginBudget.Permit probePermit = OriginBudget.TryAcquireAsync(
-                    originKey, o.MaxOriginConnections, TimeSpan.FromMilliseconds(permitBudgetMs), cancellationToken)
-                .GetAwaiter().GetResult();
-            long probePermitWaitMs = Environment.TickCount64 - permitWaitStart;
-            if (probePermit == null)
-            {
-                throw new IOException("Origin " + originKey + " has no free connection budget (" +
-                                      o.MaxOriginConnections + " in use) after " +
-                                      (permitBudgetMs / 1000.0).ToString("0.0", CultureInfo.InvariantCulture) + "s.");
-            }
 
-            bool probeWentOpenEnded;
-            HttpResponseMessage response;
-            try
-            {
-                response = SendProbe(client, url, offset, probeEnd, o, refuseWholeBody,
-                                     openDeadline, out probeWentOpenEnded, cancellationToken);
-            }
-            catch
-            {
-                probePermit.Dispose();
-                throw;
-            }
+            // The permit is taken per ATTEMPT inside SendProbe and the successful one comes back
+            // with the response, so the budget is never held across a backoff.
+            ProbeResult probed = SendProbe(client, url, offset, probeEnd, o, refuseWholeBody,
+                                           openDeadline, originKey, cancellationToken);
+            HttpResponseMessage response = probed.Response;
+            bool probeWentOpenEnded = probed.OpenEnded;
+            OriginBudget.Permit probePermit = probed.Permit;
+            long probePermitWaitMs = probed.PermitWaitMs;
 
             bool handedOff = false;
             try
@@ -347,16 +325,114 @@ namespace EmbyStrmParallel
         {
             internal HttpResponseMessage Response;
             internal bool OpenEnded;
+            /// <summary>The permit of the attempt that succeeded. The caller owns it from here.</summary>
+            internal OriginBudget.Permit Permit;
+            internal long PermitWaitMs;
         }
 
-        private static HttpResponseMessage SendProbe(HttpClient client, string url, long from, long toInclusive,
-                                                     ParallelFetchOptions o, bool refuseWholeBody, long deadline,
-                                                     out bool wentOpenEnded, CancellationToken cancellationToken)
+        /// <summary>
+        /// The smallest remainder worth starting an attempt with.
+        ///
+        /// An earlier design gave the permit wait the deadline minus one full header timeout, so
+        /// "a permit won at the last moment is still a permit the probe has time to use". That
+        /// formula had to go - 20 s subtracted from an 8 s budget clamps to nothing and the probe
+        /// would never queue at all - but what it was protecting is real: a permit won with 100 ms
+        /// left buys a TCP connection to the origin that is aborted 100 ms later, and abandoned
+        /// connections lingering at this origin are exactly what the ramp measurements show
+        /// collapsing it to 0.23 Mbps.
+        ///
+        /// RetryBaseDelayMs is admittedly the wrong DIMENSION for this - the question is "will a
+        /// connection have time to be useful", which is a handshake quantity, not a backoff one.
+        /// It is borrowed because at its 250 ms default it is about one handshake and inventing a
+        /// knob for a bound nobody tunes costs more than it buys. The Math.Min is not decoration:
+        /// the clamp on RetryBaseDelayMs admits 10000, above the whole 8000 ms budget, and a floor
+        /// larger than the budget makes the probe give up having made ZERO requests - every
+        /// TryOpen returning null instantly and every stream running at 4.1 Mbps forever. Not
+        /// reachable from strm-routing.txt today, but the clamp advertises it.
+        /// </summary>
+        internal static int UsableRemainderMs(ParallelFetchOptions o)
         {
-            ProbeResult r = SendProbeAsync(client, url, from, toInclusive, o, refuseWholeBody, deadline, cancellationToken)
-                            .GetAwaiter().GetResult();
-            wentOpenEnded = r.OpenEnded;
-            return r.Response;
+            return (int)Math.Min(o.RetryBaseDelayMs, Math.Max(1, ProbeBudgetMs(o) / 4));
+        }
+
+        /// <summary>
+        /// The probe's backoff ceiling, derived from its own budget rather than inherited from the
+        /// chunk loop's RetryMaxDelayMs (4000 ms).
+        ///
+        /// A single 4 s wait cannot fit in the tail of an 8 s budget, so the probe gave up at
+        /// ~4.1 s and abandoned the other half of it, leaving its last attempt at ~3.75 s. A
+        /// quarter of the budget keeps the tail productive: at 8 s that is 2000 ms, putting
+        /// attempts at 0 / 0.25 / 0.75 / 1.75 / 3.75 / 5.75 s nominal and the give-up between 6.2 s
+        /// (idle) and 7.9 s (under 8x CPU load) measured over 11 runs. (Nominal: RetryDelayMs adds up to 25% jitter, which is why the seventh
+        /// attempt at 7.75 s is in the arithmetic but not in the measurements.)
+        ///
+        /// A separate method rather than a local, because this is the arithmetic a test should
+        /// pin. Asserting it through a stopwatch does not work: the correct and the inherited
+        /// shape differ by exactly one attempt, and under CPU contention an oversleeping
+        /// Task.Delay costs the correct shape that attempt too - measured flaky in ~19% of loaded
+        /// runs while still failing to separate the two. ConfigTests pins it directly instead.
+        /// </summary>
+        internal static int ProbeMaxDelayMs(ParallelFetchOptions o)
+        {
+            return (int)Math.Min(o.RetryMaxDelayMs, Math.Max(1, ProbeBudgetMs(o) / 4));
+        }
+
+        /// <summary>
+        /// The one give-up exception, with the diagnosis attached.
+        ///
+        /// Its message has exactly one destination: the `reason=` field of the FALLBACK line,
+        /// which is the only clue a running Emby leaves about why a stream went single-connection.
+        /// Two of the three give-up paths used to rethrow the inner exception instead, so an
+        /// origin that accepted and never replied - the commonest shape there is - reported
+        /// "The operation was canceled." with no mention of the probe, the budget, or how many
+        /// attempts it made. It was also two verbatim copies of one string, one of them
+        /// mis-indented, neither reachable by the shapes that actually occur.
+        /// </summary>
+        private static TimeoutException ProbeGaveUp(ParallelFetchOptions o, string url, int attempt, int answered, Exception last)
+        {
+            return new TimeoutException("Probe gave up on " + FetchLog.Tail(url) + " after " +
+                (ProbeBudgetMs(o) / 1000.0).ToString("0.#", CultureInfo.InvariantCulture) + "s (" +
+                attempt + " attempts, " + answered + " answered); handing the request back to the host." +
+                (last == null ? "" : " Last: " + FetchLog.Describe(last)));
+        }
+
+        /// <summary>
+        /// How long the probe may take in total, across every attempt, whatever the origin does.
+        ///
+        /// Deliberately much tighter than the chunk-level stall budget, and the reason is where
+        /// this code runs: Open() is synchronous by construction - the injected call site returns
+        /// before any state machine starts - so every second here is an Emby request thread
+        /// pinned, and the outcome of giving up is a graceful degrade (TryOpen -> null -> Emby
+        /// serves it on one connection) rather than an error. A chunk failing is fatal to the
+        /// stream, so a chunk is worth waiting 30 s for. An open is not.
+        ///
+        /// It is ONE deadline, applied to the whole probe, and that is the load-bearing part.
+        /// The first version of this made it a second deadline layered on top of the stall
+        /// budget and checked only at the top of the retry loop, which left three ways to blow
+        /// straight through it, all measured: a header timeout still clamped to the 30 s budget
+        /// held a thread 20 s on an origin that accepted and never replied; one answered attempt
+        /// disabled the window permanently, so "answer once then go quiet" took 30 s and could
+        /// never reach MaxAttempts; and the permit wait had its own 30 s bound, so a saturated
+        /// budget took 30 s too. Every one of those sites was already clamping to `deadline`.
+        /// Tightening `deadline` fixes all of them and deletes code instead of adding it.
+        ///
+        /// 8 s is measured, not guessed: the DNS wobbles that motivated the retry rework were at
+        /// most 2.25 s, and 250/500/1000/2000 ms backoffs put attempt 6 at ~7.75 s - so this
+        /// covers the observed outage more than three times over while failing fast against an
+        /// origin that is simply gone. The cost is that an origin needing more than 8 s just to
+        /// send response headers now falls back; at that point playback was not going to work.
+        /// </summary>
+        internal static long ProbeBudgetMs(ParallelFetchOptions o)
+        {
+            return (long)Math.Min(o.StallBudget.TotalMilliseconds, 8000);
+        }
+
+        private static ProbeResult SendProbe(HttpClient client, string url, long from, long toInclusive,
+                                             ParallelFetchOptions o, bool refuseWholeBody, long deadline,
+                                             string originKey, CancellationToken cancellationToken)
+        {
+            return SendProbeAsync(client, url, from, toInclusive, o, refuseWholeBody, deadline, originKey,
+                                  cancellationToken).GetAwaiter().GetResult();
         }
 
         /// <summary>
@@ -371,9 +447,18 @@ namespace EmbyStrmParallel
         /// </summary>
         private static async Task<ProbeResult> SendProbeAsync(HttpClient client, string url, long from, long toInclusive,
                                                               ParallelFetchOptions o, bool refuseWholeBody, long deadline,
-                                                              CancellationToken cancellationToken)
+                                                              string originKey, CancellationToken cancellationToken)
         {
+            // Same split as ChunkDownloader: `attempt` drives the backoff, `answered` is what
+            // MaxAttempts caps. The probe has no progress cursor of any kind, so its deadline is
+            // an absolute wall-clock cap that nothing can reset - which makes it exactly the
+            // right owner for attempts the origin never answered. On 2026-08-31 the probe gave up
+            // on four separate ~2 s DNS wobbles and logged FALLBACK each time, handing whole
+            // films to Emby's single connection at 4.1 Mbps against a 13 Mbps requirement.
             int attempt = 0;
+            int answered = 0;
+            long permitWaitMs = 0;
+
             // -1 once we have fallen back to "bytes=<from>-".
             long rangeEnd = toInclusive;
             // The deadline is the CALLER's: Open() blocks the caller for the permit wait and this
@@ -382,16 +467,44 @@ namespace EmbyStrmParallel
             // over a minute.
             while (true)
             {
-                bool timedOut = false;
+                bool gotAnswer = false;
                 long retryAfterMs = -1;
+                long backoffMs = -1;
                 long remainingMs = deadline - Environment.TickCount64;
-                if (remainingMs <= 0)
-                {
-                    throw new TimeoutException("Probe gave up after " +
-                        o.StallBudget.TotalSeconds.ToString(CultureInfo.InvariantCulture) + "s without a usable response.");
-                }
+                if (remainingMs <= 0) throw ProbeGaveUp(o, url, attempt, answered, null);
+                // One permit per ATTEMPT, taken here rather than around the whole loop.
+                //
+                // Holding it across the retries meant holding it across the backoff sleeps too,
+                // and once unanswered attempts stopped being capped at four that stretched from
+                // ~3 s to the full 30 s - with nothing of ours in flight at the origin for almost
+                // all of it. Measured: a rival stream's wait for a permit went 2.79 s -> 29.50 s.
+                // ChunkDownloader already works this way and has a test named for it; the probe
+                // was the one place still doing it the old way.
+                OriginBudget.Permit permit = null;
+                long permitStart = Environment.TickCount64;
                 try
                 {
+                    permit = await OriginBudget.TryAcquireAsync(originKey, o.MaxOriginConnections,
+                                    TimeSpan.FromMilliseconds(Math.Max(1, deadline - Environment.TickCount64)),
+                                    cancellationToken).ConfigureAwait(false);
+                    permitWaitMs += Environment.TickCount64 - permitStart;
+                    if (permit == null)
+                    {
+                        throw new IOException("Origin " + originKey + " has no free connection budget (" +
+                                              o.MaxOriginConnections + " in use).");
+                    }
+                    // A USABLE remainder, not merely a positive one. The earlier design gave the
+                    // permit wait the deadline minus one full header timeout, so "a permit won at
+                    // the last moment is still a permit the probe has time to use"; that formula
+                    // had to go (20s subtracted from an 8s budget clamps to 1ms and the probe
+                    // would never queue at all), but the consequence it named is real and came
+                    // back with it. A permit won with 100ms left buys a TCP connection to the
+                    // origin that is aborted 100ms later - and abandoned connections lingering at
+                    // this origin are precisely what the ramp measurements show collapsing it.
+                    // One existing knob as the floor, no second deadline.
+                    remainingMs = deadline - Environment.TickCount64;
+                    if (remainingMs < UsableRemainderMs(o)) throw ProbeGaveUp(o, url, attempt, answered, null);
+
                     HttpResponseMessage response;
                     CancellationTokenSource probe = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                     try
@@ -412,11 +525,7 @@ namespace EmbyStrmParallel
                         req.VersionPolicy = HttpVersionPolicy.RequestVersionOrLower;
                         response = await client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, probe.Token)
                                                .ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-                    {
-                        timedOut = true;
-                        throw;
+                        gotAnswer = true;   // everything below this point is a reply we chose to reject
                     }
                     finally
                     {
@@ -447,37 +556,75 @@ namespace EmbyStrmParallel
                     }
 
                     if (!HttpRangeHelper.IsTransientStatus(response.StatusCode))
-                        return new ProbeResult { Response = response, OpenEnded = rangeEnd < 0 };
+                    {
+                        ProbeResult ok = new ProbeResult
+                        {
+                            Response = response,
+                            OpenEnded = rangeEnd < 0,
+                            Permit = permit,
+                            PermitWaitMs = permitWaitMs
+                        };
+                        permit = null;   // ownership moves to the caller with the body
+                        return ok;
+                    }
 
                     HttpStatusCode transient = response.StatusCode;
                     retryAfterMs = HttpRangeHelper.RetryAfterMs(response);
                     try { response.Dispose(); } catch { }
                     throw new HttpRequestException("Probe returned " + (int)transient + ".", null, transient);
                 }
+                catch (TimeoutException)
+                {
+                    // Our own give-up, thrown from inside this try after the permit is taken. It
+                    // escapes today only because IsRetryable happens to reject TimeoutException;
+                    // adding that type to IsTransientException would silently turn the probe's
+                    // terminal state into an infinite retry. Say it out loud instead.
+                    throw;
+                }
                 catch (Exception ex)
                 {
                     if (cancellationToken.IsCancellationRequested) throw;
-                    if (attempt + 1 >= o.MaxAttempts)
-                    {
-                        if (timedOut)
-                        {
-                            throw new TimeoutException("Probe request timed out after " +
-                                o.ResponseHeadersTimeout.TotalSeconds.ToString(CultureInfo.InvariantCulture) +
-                                "s (" + o.MaxAttempts + " attempts).");
-                        }
-                        throw;
-                    }
+                    if (gotAnswer) answered++;
+
+                    // Retryability gate, shared with the chunk loop. Without it the only bound on
+                    // a structurally impossible error - a malformed URL, an unsupported scheme, an
+                    // OOM - is the wall clock, because those never set `gotAnswer` and so never
+                    // touch `answered`. A bad prefix in strm-routing.txt would burn the full probe
+                    // budget on a blocked host thread on every single request. It also restores
+                    // the TryOpen fast path for OutOfMemoryException, which retrying swallowed.
+                    if (!HttpRangeHelper.IsRetryable(ex)) throw;
+
+                    // No `timedOut` special case here any more: a timeout never sets gotAnswer, so
+                    // it never increments `answered`, so this branch could not be reached by one.
+                    // The probe budget owns that shape and says so in its message.
+                    if (answered >= o.MaxAttempts) throw;
                     attempt++;
-                    Log("probe retry " + attempt + "/" + (o.MaxAttempts - 1) + " url=" + FetchLog.Tail(url) +
+                    Log("probe retry " + attempt + " (answered " + answered + "/" + o.MaxAttempts + ") url=" + FetchLog.Tail(url) +
                         " range=" + from + "-" + (rangeEnd < 0 ? "(end)" : rangeEnd.ToString(CultureInfo.InvariantCulture)) +
                         " after " + FetchLog.Describe(ex));
-                    long backoff = Math.Min((long)o.RetryBaseDelayMs << Math.Min(attempt - 1, 20), o.RetryMaxDelayMs);
-                    long delay = HttpRangeHelper.RetryDelayMs((int)backoff, retryAfterMs);
+                    long delay = HttpRangeHelper.RetryDelayMs(
+                        HttpRangeHelper.BackoffMs(attempt, o.RetryBaseDelayMs, ProbeMaxDelayMs(o)), retryAfterMs);
+                    // Give up NOW rather than sleep out a backoff we already know is too long.
+                    // Sleeping the remainder and failing on the next pass is what ChunkDownloader
+                    // does, and it is right there: a chunk failing is fatal to the stream, so the
+                    // last fraction of a second is worth spending. Here it is not - the probe's
+                    // failure is a free degrade, and what it spends is a synchronously-blocked
+                    // Emby request thread. A 503 with `Retry-After: 3600` would otherwise sleep
+                    // the entire remaining budget doing nothing and then fail anyway.
                     long left = deadline - Environment.TickCount64;
-                    if (left <= 0) throw;
-                    if (delay > left) delay = left;
-                    await Task.Delay((int)delay, cancellationToken).ConfigureAwait(false);
+                    if (left <= 0 || delay + UsableRemainderMs(o) > left) throw ProbeGaveUp(o, url, attempt, answered, ex);
+
+                    // The permit is already back (the finally below runs first): sleeping on the
+                    // origin's budget while making no request to the origin is the exact thing
+                    // this loop was doing wrong.
+                    backoffMs = delay;
                 }
+                finally
+                {
+                    if (permit != null) permit.Dispose();
+                }
+
+                if (backoffMs > 0) await Task.Delay((int)backoffMs, cancellationToken).ConfigureAwait(false);
             }
         }
 

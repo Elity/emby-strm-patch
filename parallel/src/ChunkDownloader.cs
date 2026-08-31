@@ -78,7 +78,11 @@ namespace EmbyStrmParallel
                                           PreOpenedChunk preOpened, CancellationToken ct)
         {
             Cursor cursor = new Cursor { Pos = start, LastProgressTicks = Environment.TickCount64 };
+            // Every attempt, so the backoff keeps growing even through a run of unanswered ones -
+            // without this an outage would spin at the 250 ms base delay.
             int attempt = 0;
+            // Only the attempts the origin answered. This, not `attempt`, is what MaxAttempts caps.
+            int answered = 0;
             PreOpenedChunk pre = preOpened;
             long stallBudgetMs = (long)_o.StallBudget.TotalMilliseconds;
 
@@ -175,7 +179,23 @@ namespace EmbyStrmParallel
                 {
                     if (ct.IsCancellationRequested) throw;
 
-                    if (!IsRetryable(ex) || attempt + 1 >= _o.MaxAttempts)
+                    // Only an attempt the origin ANSWERED counts against MaxAttempts.
+                    //
+                    // The two bounds here are not interchangeable and each has exactly one shape
+                    // it can police. The stall budget cannot stop a connection that trickles: the
+                    // throughput floor publishes a short block before it throws, which resets
+                    // LastProgressTicks, so MaxAttempts is that shape's only brake. And
+                    // MaxAttempts is far too tight for the opposite shape: four attempts at
+                    // 250/500/1000 ms give up 1.75-2.19 s in, which on 2026-08-31 killed two live
+                    // streams over DNS wobbles that never lasted past 2.25 s - with 28 of the
+                    // 30 s stall budget unspent, because nothing had been published for it to
+                    // measure against.
+                    //
+                    // So: answered -> count it, the origin is talking and repeating is on us.
+                    // Unanswered -> the stall budget owns it, which is what it was built for.
+                    if (response != null) answered++;
+
+                    if (!HttpRangeHelper.IsRetryable(ex) || answered >= _o.MaxAttempts)
                     {
                         throw new IOException(
                             "Parallel chunk [" + start.ToString(System.Globalization.CultureInfo.InvariantCulture) + "-" +
@@ -191,11 +211,13 @@ namespace EmbyStrmParallel
                     // we come back before it asked. Sleeping out the remainder means the next
                     // pass through the loop reports the failure, which is the right outcome.
                     long budgetLeft = stallBudgetMs - (Environment.TickCount64 - cursor.LastProgressTicks);
-                    long delay = HttpRangeHelper.RetryDelayMs(BackoffMs(attempt), retryAfterMs);
+                    long delay = HttpRangeHelper.RetryDelayMs(
+                        HttpRangeHelper.BackoffMs(attempt, _o.RetryBaseDelayMs, _o.RetryMaxDelayMs), retryAfterMs);
                     if (delay > budgetLeft) delay = budgetLeft;
                     if (delay < 0) delay = 0;
-                    FetchLog.Write(_tag + " chunk [" + start + "-" + endInclusive + "] retry " + attempt + "/" +
-                                   (_o.MaxAttempts - 1) + " resuming at " + cursor.Pos + " after " + FetchLog.Describe(ex));
+                    FetchLog.Write(_tag + " chunk [" + start + "-" + endInclusive + "] retry " + attempt +
+                                   " (answered " + answered + "/" + _o.MaxAttempts + ")" +
+                                   " resuming at " + cursor.Pos + " after " + FetchLog.Describe(ex));
                     // Slept AFTER the finally below, never here: nothing of ours is in flight at
                     // the origin during a backoff, so holding the permit (and the dead response)
                     // through it hands a Retry-After the power to park the whole budget asleep -
@@ -436,26 +458,6 @@ namespace EmbyStrmParallel
             }
         }
 
-        private static bool IsRetryable(Exception ex)
-        {
-            if (ex is NotSupportedException) return false;                 // server ignored Range
-            if (ex is OriginBudgetTimeoutException) return false;          // our own limiter, wedged
-            if (ex is OperationCanceledException) return true;             // our own phase timeout
-            HttpRequestException hre = ex as HttpRequestException;
-            if (hre != null)
-            {
-                if (hre.StatusCode.HasValue) return HttpRangeHelper.IsTransientStatus(hre.StatusCode.Value);
-                return true;                                               // connect/DNS/reset
-            }
-            if (HttpRangeHelper.IsTransientException(ex)) return true;
-            return false;
-        }
 
-        private int BackoffMs(int attempt)
-        {
-            long d = (long)_o.RetryBaseDelayMs << Math.Min(attempt - 1, 20);
-            if (d > _o.RetryMaxDelayMs) d = _o.RetryMaxDelayMs;
-            return (int)d;
-        }
     }
 }

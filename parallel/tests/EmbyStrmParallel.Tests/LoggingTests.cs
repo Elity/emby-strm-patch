@@ -1,4 +1,6 @@
 using System;
+using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
@@ -182,16 +184,112 @@ namespace EmbyStrmParallel.Tests
                 {
                     long? t, cl;
                     // Nothing is listening on this port, so the probe cannot succeed.
+                    //
+                    // The two assertions below are about COST, not content, and they exist because
+                    // this test once absorbed a 2.0s -> 30.0s regression without going red. Open()
+                    // is synchronous by construction, so every second spent here is an Emby request
+                    // thread pinned on an origin that is simply gone.
+                    Stopwatch sw = Stopwatch.StartNew();
                     Stream s = ParallelFetch.TryOpen("http://127.0.0.1:9/never", 0, 1000, out t, out cl, ct);
+                    sw.Stop();
                     Harness.Assert(s == null, "TryOpen should return null on failure");
+                    // 20s, not 12. The bound being defended is "not 30s of pinned host thread";
+                    // 12 left only ~2s of headroom over a measured 9.9s on a CPU-loaded machine,
+                    // and the target is a J4125. 20 keeps 10s of separation on BOTH sides.
+                    Harness.Assert(sw.Elapsed.TotalSeconds < 20,
+                        "a dead origin pinned the calling thread for " + sw.Elapsed.TotalSeconds.ToString("0.0") +
+                        "s before falling back; the probe budget is meant to cap this near 8s");
+                    // Lower bound, guarding the opposite failure: a probe so impatient that a
+                    // short wobble forces a fallback. That is where this whole change started -
+                    // on 2026-08-31 the probe bailed after ~1.9s, four times, over DNS wobbles
+                    // that were done inside 2.25s, handing a 13 Mbps film to a 4.1 Mbps single
+                    // connection each time. A shrunken probe window measures 2.0s, so 4 separates
+                    // them 2x while sitting well under the measured spread (6.2s idle to 7.9s under 8x CPU load -
+                    // and load pushes this UP, toward the 8s budget, so the risk is not on this side).
+                    Harness.Assert(sw.Elapsed.TotalSeconds > 4,
+                        "the probe gave up after only " + sw.Elapsed.TotalSeconds.ToString("0.0") +
+                        "s; a short origin wobble would be enough to force a fallback");
                     Harness.Assert(t == null && cl == null, "out params must be null on failure");
                     Harness.Assert(File.Exists(logPath), "no log file was written for the fallback");
                     string text = ReadLog(logPath);
                     Harness.Assert(text.Contains("FALLBACK to host path"), "fallback not logged: " + text);
                     Harness.Assert(text.Contains("reason="), "no reason recorded: " + text);
+                    // The reason has to be the PROBE's diagnosis, not whatever exception happened
+                    // to be in flight. Two of the three give-up paths used to rethrow the inner
+                    // one, so the commonest shape of all - origin accepts, never replies - wrote
+                    // `reason=TaskCanceledException: The operation was canceled.` into the only
+                    // record a running Emby keeps of why a stream went single-connection.
+                    Harness.Assert(text.Contains("Probe gave up on"),
+                        "the fallback reason is not the probe's own diagnosis: " + text);
+                    Harness.Assert(text.Contains("attempts,") && text.Contains("answered)"),
+                        "the reason does not say how many attempts were made or answered: " + text);
                     Harness.Assert(text.Contains("offset=0"), "offset missing: " + text);
+
+                    // Upper bound on retries, which is what actually pins the backoff arithmetic.
+                    // Feeding the ANSWERED counter to BackoffMs instead of the attempt counter
+                    // computes `base << -1`; the shift masks to 63, the result is 0, the clamp
+                    // turns it into no delay at all, and the loop becomes a connect storm -
+                    // measured at 39,253 attempts in 30s. Every content assertion above stayed
+                    // green through that. The probe caps its backoff at a quarter of its budget,
+                    // so 250/500/1000/2000/2000ms fits ~6 attempts into 8s.
+                    int probeRetries = 0;
+                    foreach (string l in text.Split('\n')) if (l.Contains("probe retry")) probeRetries++;
+                    Harness.Assert(probeRetries <= 15,
+                        "the probe made " + probeRetries + " retries against a dead origin; the backoff is " +
+                        "not growing, so this is a hot loop rather than a retry policy");
+
+                    // A collapse smoke test, and deliberately nothing finer.
+                    //
+                    // The property worth pinning here - the probe caps its backoff at a quarter of
+                    // its own budget rather than inheriting RetryMaxDelayMs - separates the correct
+                    // and broken shapes by exactly ONE attempt (6 vs 5). A stopwatch cannot resolve
+                    // that: under CPU contention an oversleeping Task.Delay costs the CORRECT shape
+                    // an attempt too, measured at 4 failures in 21 loaded runs, with correct-code
+                    // counts of 4 and 5 landing inside the broken shape's band. An assertion that
+                    // is 19% flaky AND cannot separate its own mutant is worse than none.
+                    //
+                    // That arithmetic is pinned deterministically in ConfigTests instead, against
+                    // ParallelFetch.ProbeMaxDelayMs. What stays here is the thing only an
+                    // end-to-end run can see: the retry loop is running at all.
+                    Harness.Assert(probeRetries >= 4,
+                        "the probe managed only " + probeRetries + " retries in its whole budget; the retry " +
+                        "loop has collapsed rather than merely mis-tuned");
+
                     await Task.CompletedTask;
-                    return text.Trim().Substring(24, Math.Min(80, text.Trim().Length - 24));
+                    return probeRetries + " retries, gave up in " + sw.Elapsed.TotalSeconds.ToString("0.0") + "s";
+                }
+                finally { Disarm(); try { Directory.Delete(dir, true); } catch { } }
+            }).ConfigureAwait(false);
+
+            await Harness.RunAsync("an error retrying cannot fix is not retried", async () =>
+            {
+                // The other side of moving unanswered attempts off MaxAttempts. Those attempts are
+                // now bounded only by the probe's wall clock, so an exception that CANNOT succeed
+                // no matter how often it is repeated - a malformed prefix in strm-routing.txt, an
+                // unsupported scheme, an OOM - would burn the entire budget every time, on a
+                // synchronously-blocked Emby request thread, for every request to that prefix.
+                // Before the change MaxAttempts capped it at four tries in ~1.75s; the gate that
+                // replaced it is HttpRangeHelper.IsRetryable, shared with the chunk loop.
+                string dir = NewTempDir();
+                string logPath = Path.Combine(dir, "parallel.log");
+                Arm(logPath);
+                try
+                {
+                    long? t, cl;
+                    Stopwatch sw = Stopwatch.StartNew();
+                    Stream s = ParallelFetch.TryOpen("http://[not-a-uri/never", 0, 1000, out t, out cl, ct);
+                    sw.Stop();
+                    Harness.Assert(s == null, "a malformed url should not produce a stream");
+                    Harness.Assert(sw.Elapsed.TotalSeconds < 2,
+                        "a malformed url took " + sw.Elapsed.TotalSeconds.ToString("0.0") +
+                        "s to reject; retrying it cannot ever succeed, so this is pure blocked host thread");
+
+                    string text = ReadLog(logPath);
+                    int retries = 0;
+                    foreach (string l in text.Split('\n')) if (l.Contains("probe retry")) retries++;
+                    Harness.AssertEqual(0, retries, "a malformed url was retried " + retries + " time(s)");
+                    await Task.CompletedTask;
+                    return "rejected in " + sw.Elapsed.TotalSeconds.ToString("0.00") + "s with 0 retries";
                 }
                 finally { Disarm(); try { Directory.Delete(dir, true); } catch { } }
             }).ConfigureAwait(false);
@@ -425,6 +523,90 @@ namespace EmbyStrmParallel.Tests
                         Harness.Assert(open.Contains("conn=2(clamped by max-origin-connections=2)"),
                             "the clamp is recorded in a flag but never rendered: " + open);
                         return "conn=2(clamped by max-origin-connections=2) originBudget=2";
+                    }
+                }
+                finally { Disarm(); try { Directory.Delete(dir, true); } catch { } }
+            }).ConfigureAwait(false);
+
+            await Harness.RunAsync("abandoning a stream logs no FAILED lines, only the summary", async () =>
+            {
+                // A seek cancels every chunk still in flight. That is the design, not a fault,
+                // and on 2026-08-31 it produced 231 "FAILED" lines against 12 real ones - so the
+                // real failures could only be found with a grep -v. The closing line already says
+                // ABANDONED and chunks=A/B; the per-chunk lines added nothing but volume.
+                string dir = NewTempDir();
+                string logPath = Path.Combine(dir, "parallel.log");
+                Arm(logPath);
+                try
+                {
+                    using (MockServer srv = new MockServer(FileSize, fastContent: false))
+                    {
+                        srv.ThrottleBytesPerSec = 256 * 1024;   // keep several chunks in flight at dispose
+                        long? t, cl;
+                        Stream s2 = ParallelFetch.OpenWith(srv.Url, 0, 3 * 1024 * 1024, Small(), out t, out cl, ct);
+                        byte[] tiny = new byte[4096];
+                        await s2.ReadAsync(tiny.AsMemory(0, tiny.Length), ct).ConfigureAwait(false);
+                        await Task.Delay(250, ct).ConfigureAwait(false);
+                        s2.Dispose();
+
+                        // Workers unwind after Dispose returns, so wait for the summary line rather
+                        // than for a fixed duration: a fixed sleep that is too short reads a log
+                        // missing the very lines this test counts, and reports 0 for the wrong reason.
+                        string text = "";
+                        for (int i = 0; i < 60; i++)
+                        {
+                            text = ReadLog(logPath);
+                            if (text.Contains("closed ABANDONED")) break;
+                            await Task.Delay(50, ct).ConfigureAwait(false);
+                        }
+                        await Task.Delay(200, ct).ConfigureAwait(false);   // let any straggler log land
+                        text = ReadLog(logPath);
+                        int failedLines = 0;
+                        foreach (string l in text.Split('\n')) if (l.Contains("FAILED:")) failedLines++;
+                        Harness.Assert(text.Contains("closed ABANDONED"),
+                            "the close summary went missing along with the noise: " + text);
+                        Harness.AssertEqual(0, failedLines,
+                            "teardown logged " + failedLines + " FAILED line(s); a cancelled chunk is not a failure");
+                        return "abandoned mid-stream, 0 FAILED lines, summary intact";
+                    }
+                }
+                finally { Disarm(); try { Directory.Delete(dir, true); } catch { } }
+            }).ConfigureAwait(false);
+
+            await Harness.RunAsync("a chunk that really fails is still logged as FAILED", async () =>
+            {
+                // The other half of the filter: silencing teardown must not silence anything that
+                // failed on its own merits.
+                string dir = NewTempDir();
+                string logPath = Path.Combine(dir, "parallel.log");
+                Arm(logPath);
+                try
+                {
+                    using (MockServer srv = new MockServer(FileSize, fastContent: false))
+                    {
+                        // 403 on every attempt for one chunk: answered every time, so MaxAttempts
+                        // governs and the chunk gives up for real.
+                        srv.FaultHook = (seq, f, t2) => f >= 64 * 1024 ? MockFault.Status403 : MockFault.None;
+                        ParallelFetchOptions o = Small();
+                        o.MaxAttempts = 2;
+                        try
+                        {
+                            long? t, cl;
+                            using (Stream s3 = ParallelFetch.OpenWith(srv.Url, 0, 400000, o, out t, out cl, ct))
+                            {
+                                await Harness.ReadAllAsync(s3, 32 * 1024, ct).ConfigureAwait(false);
+                            }
+                            throw new Exception("the doomed stream completed; this test no longer provokes a failure");
+                        }
+                        catch (IOException) { /* expected */ }
+                        finally { srv.FaultHook = null; }
+
+                        string text = ReadLog(logPath);
+                        Harness.Assert(text.Contains("FAILED:"),
+                            "a genuine chunk failure was silenced along with the teardown noise: " + text);
+                        Harness.Assert(text.Contains("failed after"),
+                            "the give-up reason is missing: " + text);
+                        return "real failure still reported";
                     }
                 }
                 finally { Disarm(); try { Directory.Delete(dir, true); } catch { } }

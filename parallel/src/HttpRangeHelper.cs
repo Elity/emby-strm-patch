@@ -191,6 +191,52 @@ namespace EmbyStrmParallel
         }
 
         /// <summary>
+        /// Is retrying this exception capable of a different outcome?
+        ///
+        /// Shared by the chunk loop and the probe loop for the same reason BackoffMs is: they
+        /// must not drift apart on retry policy. The probe had no gate at all, which was harmless
+        /// only while MaxAttempts capped every shape at four - once unanswered attempts moved off
+        /// that counter, a structurally impossible error (a malformed URL in strm-routing.txt
+        /// throwing UriFormatException, an unsupported scheme throwing NotSupportedException) had
+        /// nothing left to stop it but the wall clock, and burned the whole probe budget on a
+        /// synchronously-blocked Emby request thread, per request, forever.
+        /// </summary>
+        internal static bool IsRetryable(Exception ex)
+        {
+            if (IsFatalToProcess(ex)) return false;                        // the process, not the origin
+            if (ex is NotSupportedException) return false;                 // server ignored Range
+            if (ex is OriginBudgetTimeoutException) return false;          // our own limiter, wedged
+            if (ex is OperationCanceledException) return true;             // our own phase timeout
+            HttpRequestException hre = ex as HttpRequestException;
+            if (hre != null)
+            {
+                if (hre.StatusCode.HasValue) return IsTransientStatus(hre.StatusCode.Value);
+                return true;                                               // connect/DNS/reset
+            }
+            if (IsTransientException(ex)) return true;
+            return false;
+        }
+
+        /// <summary>
+        /// Exponential backoff for attempt N (1-based), capped. One copy, because the chunk loop
+        /// and the probe loop must not drift apart on retry policy - they were two identical
+        /// hand-written expressions in two files.
+        /// </summary>
+        internal static int BackoffMs(int attempt, int baseMs, int maxMs)
+        {
+            // Math.Max guards the 1-based contract. A caller passing 0 shifts by -1, and a shift
+            // count on a long is masked to & 63, so `base << -1` becomes `base << 63` - which
+            // overflows to a NEGATIVE number that the clamp below then flattens to zero delay.
+            // The result is not a slow retry, it is no retry delay at all: feeding the wrong
+            // counter in here once produced 39,253 connect attempts in 30 seconds. Clamping the
+            // shift instead turns a caller's bug into a merely-flat backoff rather than a storm.
+            long d = (long)baseMs << Math.Min(Math.Max(attempt - 1, 0), 20);
+            if (d > maxMs) d = maxMs;
+            if (d < 0) d = 0;
+            return (int)d;
+        }
+
+        /// <summary>
         /// Retry delay: never shorter than what the server asked for, plus up to 25% jitter so
         /// N workers that failed together do not come back together.
         ///

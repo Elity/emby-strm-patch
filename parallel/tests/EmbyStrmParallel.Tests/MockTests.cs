@@ -428,6 +428,11 @@ namespace EmbyStrmParallel.Tests
             await IgnoredRangeSkipCeilingAsync(ct).ConfigureAwait(false);
             await ContentEncodingAsync(ct).ConfigureAwait(false);
             await RetryAfterAsync(ct).ConfigureAwait(false);
+            await UnansweredBurstAsync(ct).ConfigureAwait(false);
+            await TrickleAlwaysGivesUpAsync(ct).ConfigureAwait(false);
+            await StallBudgetStopsAnUnansweringOriginAsync(ct).ConfigureAwait(false);
+            await ProbeRidesOutUnansweredBurstAsync(ct).ConfigureAwait(false);
+            await ProbeBudgetHoldsWhateverTheOriginDoesAsync(ct).ConfigureAwait(false);
 
             Harness.Section("mock server: backpressure, memory, cancellation");
 
@@ -471,6 +476,7 @@ namespace EmbyStrmParallel.Tests
             await BudgetDeclinesWhenFullAsync(ct).ConfigureAwait(false);
             await BudgetSurvivesAStalledReaderAsync(ct).ConfigureAwait(false);
             await BudgetFreedDuringBackoffAsync(ct).ConfigureAwait(false);
+            await BudgetFreedDuringProbeBackoffAsync(ct).ConfigureAwait(false);
             await BudgetWithConnectionRampAsync(ct).ConfigureAwait(false);
             await BudgetWakesQueuedWorkersOnDisposeAsync(ct).ConfigureAwait(false);
         }
@@ -759,7 +765,10 @@ namespace EmbyStrmParallel.Tests
                     MockFault[] faults =
                     {
                         MockFault.None, MockFault.Status403, MockFault.Status500,
-                        MockFault.Status503RetryAfter, MockFault.TruncateHalf, MockFault.Trickle
+                        MockFault.Status503RetryAfter, MockFault.TruncateHalf, MockFault.Trickle,
+                        // The unanswered shape now retries on a different counter to everything
+                        // else above, so it reaches the release path a different number of times.
+                        MockFault.NoResponse
                     };
                     int seqOffset = 0;
                     srv.FaultHook = (seq, f, t) => faults[(seq + seqOffset) % faults.Length];
@@ -841,20 +850,48 @@ namespace EmbyStrmParallel.Tests
                         // queue behind A forever and the elapsed-time assertion below is never
                         // reached. Neither Harness.RunAsync nor the CI job had a timeout, so that
                         // shape would have burned to GitHub's six-hour ceiling.
+                        //
+                        // Task.Run is what makes that bound real. OpenWith blocks its caller
+                        // through the probe's own TryAcquireAsync, so without it the WaitAsync
+                        // below could not start counting until the probe had already returned -
+                        // a timeout that cannot fire, on the one test whose failure mode is a hang.
                         Stopwatch sw = Stopwatch.StartNew();
-                        Fetched got = await FetchAsync(b.Url, 0, 1024 * 1024, Budgeted(4, 4), ct)
-                                            .WaitAsync(TimeSpan.FromSeconds(10), ct).ConfigureAwait(false);
+                        Task<Fetched> bFetch = Task.Run(() => FetchAsync(b.Url, 0, 1024 * 1024, Budgeted(4, 4), ct));
+
+                        // Sample A while B is being served. Asserting A was saturated BEFORE B
+                        // started says nothing about the moment that matters: if A had drained,
+                        // B getting through would prove nothing about the split.
+                        // Seeded from a real reading and closed with another, so the running
+                        // minimum can never be vacuous. B is served in 10-60 ms, so the loop
+                        // itself may sample zero times - and `int.MaxValue` would then satisfy
+                        // the assertion by never having looked, which is the wrong direction for
+                        // a value that only rises as sampling thins out.
+                        int aFloor = OriginBudget.InUse(OriginBudget.KeyFor(a.Url));
+                        while (!bFetch.IsCompleted)
+                        {
+                            int inUse = OriginBudget.InUse(OriginBudget.KeyFor(a.Url));
+                            if (inUse < aFloor) aFloor = inUse;
+                            await Task.Delay(5, ct).ConfigureAwait(false);
+                        }
+                        int after = OriginBudget.InUse(OriginBudget.KeyFor(a.Url));
+                        if (after < aFloor) aFloor = after;
+                        Fetched got = await bFetch.WaitAsync(TimeSpan.FromSeconds(10), ct).ConfigureAwait(false);
                         sw.Stop();
 
                         run.Cancel();
                         await Task.WhenAll(hogs).ConfigureAwait(false);
 
                         Harness.AssertBytesEqual(Pattern.Range(0, 1024 * 1024), got.Data, "origin B bytes");
-                        // 3s, not 10: the WaitAsync above already turns a hang into a failure, so
-                        // an assertion at the same bound could never fire. B is served in 0.0-0.1s
-                        // when the split works at all.
-                        Harness.Assert(sw.Elapsed.TotalSeconds < 3,
+                        // 0.5s, not 3s. B is served in 0.0-0.1s when the split works, and a
+                        // COMPLETELY merged budget - KeyFor returning one key for every origin -
+                        // lands at 2.9-3.1s, because attempt-scoped permits cycle fast enough that
+                        // B eventually squeezes through. At a 3s threshold that mutant was a coin
+                        // flip: measured PASS on one run and FAIL on the next, same binary.
+                        Harness.Assert(sw.Elapsed.TotalSeconds < 0.5,
                             "origin B took " + sw.Elapsed.TotalSeconds.ToString("0.0") + "s while A was saturated");
+                        Harness.Assert(aFloor >= 4,
+                            "origin A dropped to " + aFloor + " permits in use while B was being served, so B may " +
+                            "simply have been handed A's spare capacity - which proves nothing about the split");
 
                         // The only budget test that never checked its permits came back - which
                         // also makes it the only one that could not notice a leak confined to
@@ -1042,20 +1079,29 @@ namespace EmbyStrmParallel.Tests
 
                     ParallelFetchOptions o = Budgeted(connections: 3, budget: 3);
                     o.StallBudget = TimeSpan.FromSeconds(3);
-                    o.ResponseHeadersTimeout = TimeSpan.FromSeconds(1);   // leaves ~2s for the permit wait
+                    // Small, but it no longer carves anything out for the permit wait: every wait
+                    // in the probe now shares one deadline, ProbeBudgetMs = min(StallBudget, 8s),
+                    // which here is the 3s above.
+                    o.ResponseHeadersTimeout = TimeSpan.FromSeconds(1);
 
                     long? t, c;
                     Stopwatch sw = Stopwatch.StartNew();
-                    bool declined = false;
+                    string why = null;
                     try
                     {
                         Stream doomed = ParallelFetch.OpenWith(srv.Url, 0, 0, o, out t, out c, ct);
                         doomed.Dispose();
                     }
-                    catch (IOException) { declined = true; }
+                    catch (Exception ex) { why = ex.Message; }
                     sw.Stop();
 
-                    Harness.Assert(declined, "opened a stream against an origin with no budget left");
+                    Harness.Assert(why != null, "opened a stream against an origin with no budget left");
+                    // The message, not the type. It lands in the `reason=` field of the FALLBACK
+                    // line, which is the only thing a running Emby leaves behind to explain why a
+                    // stream went single-connection - so "no free connection budget" has to survive
+                    // all the way out, whatever wrapper the give-up path puts around it.
+                    Harness.Assert(why.Contains("no free connection budget"),
+                        "declined without saying the budget was the reason: " + why);
                     Harness.Assert(sw.Elapsed.TotalSeconds < 6,
                         "took " + sw.Elapsed.TotalSeconds.ToString("0.0") + "s to decline, and that wait is on " +
                         "a host request thread");
@@ -1198,6 +1244,87 @@ namespace EmbyStrmParallel.Tests
                         "the budget was never idle for more than " + longestIdleRun + " ms during a 2s backoff; " +
                         "the permit is being held across the sleep");
                     return "budget idle " + longestIdleRun + " ms of a 2s backoff";
+                }
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// The same invariant as the chunk backoff, for the probe - which is where it was being
+        /// broken.
+        ///
+        /// The probe used to take one permit around its ENTIRE retry loop, backoff sleeps
+        /// included. That was ~3 s of over-holding while `MaxAttempts` capped unanswered attempts
+        /// at four; once the stall budget took over that class it became the full 30 s, with no
+        /// request of ours in flight at the origin for nearly all of it. Measured before the fix:
+        /// a rival's wait for a permit went 2.79 s -> 29.50 s. On a budget of 12, twelve streams
+        /// opening against a wobbling origin would have parked the whole thing.
+        /// </summary>
+        private static async Task BudgetFreedDuringProbeBackoffAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("a probe waiting out a backoff is not holding the budget", async () =>
+            {
+                using (MockServer srv = new MockServer(FileSize, fastContent: false))
+                {
+                    OriginBudget.ResetForTests();
+                    string key = OriginBudget.KeyFor(srv.Url);
+
+                    Stopwatch outage = Stopwatch.StartNew();
+                    srv.FaultHook = (seq, f, t) => outage.ElapsedMilliseconds < 3000 ? MockFault.NoResponse : MockFault.None;
+                    try
+                    {
+                        ParallelFetchOptions o = Budgeted(connections: 1, budget: 1);
+                        o.ResponseHeadersTimeout = TimeSpan.FromMilliseconds(200);
+                        o.StallBudget = TimeSpan.FromSeconds(20);
+
+                        // Production-scale backoffs, and they are the entire experiment. The first
+                        // version of this test inherited Small()'s 10-50ms delays, which made
+                        // "holds the permit across the backoff" and "releases it" differ by tens of
+                        // milliseconds - so a faithful mutant that slept inside the try passed.
+                        // At 300ms+ the two are unmistakable.
+                        o.RetryBaseDelayMs = 300;
+                        o.RetryMaxDelayMs = 1500;
+
+                        // Task.Run, because ParallelFetch.OpenWith blocks its caller for the whole
+                        // probe (by design - the injected call site returns before any state
+                        // machine starts). Calling FetchAsync directly would run the probe on THIS
+                        // thread and the sampling loop below would not execute until it finished.
+                        Task<Fetched> open = Task.Run(() => FetchAsync(srv.Url, 0, 200000, o, ct));
+
+                        // Measure the LONGEST CONTIGUOUS window in which the budget was free, not
+                        // whether it was ever free. "Ever free" is satisfied by the sliver between
+                        // one attempt's release and the next attempt's acquire, which exists in
+                        // both the fixed and the broken shape - that is precisely why the first
+                        // version of this test could not tell them apart.
+                        //
+                        // Fixed: the permit is released before the backoff, so a free window is a
+                        // whole backoff, >= 300ms. Broken: the sleep happens inside the try and the
+                        // free window collapses to the loop's own turnaround, a few ms at most.
+                        long longestFreeMs = 0, freeSince = 0;
+                        while (!open.IsCompleted && outage.ElapsedMilliseconds < 3000)
+                        {
+                            long now = Environment.TickCount64;
+                            if (OriginBudget.InUse(key) == 0)
+                            {
+                                if (freeSince == 0) freeSince = now;
+                                else if (now - freeSince > longestFreeMs) longestFreeMs = now - freeSince;
+                            }
+                            else freeSince = 0;
+                            await Task.Delay(20, ct).ConfigureAwait(false);
+                        }
+
+                        Fetched got = await open.WaitAsync(TimeSpan.FromSeconds(40), ct).ConfigureAwait(false);
+                        Harness.AssertBytesEqual(Pattern.Range(0, 200000), got.Data, "bytes once the outage cleared");
+                        Harness.Assert(longestFreeMs >= 150,
+                            "the budget was free for at most " + longestFreeMs + "ms at a stretch while the probe " +
+                            "backed off for " + o.RetryBaseDelayMs + "ms or more; the probe is sitting on a permit " +
+                            "while making no request at all");
+
+                        for (int i = 0; i < 60 && OriginBudget.InUse(key) != 0; i++)
+                            await Task.Delay(50, ct).ConfigureAwait(false);
+                        Harness.AssertEqual(0, OriginBudget.InUse(key), "permits after teardown");
+                        return "budget free for " + longestFreeMs + "ms at a stretch during probe backoffs";
+                    }
+                    finally { srv.FaultHook = null; }
                 }
             }).ConfigureAwait(false);
         }
@@ -1662,6 +1789,370 @@ namespace EmbyStrmParallel.Tests
                         "only " + pinned + " of " + total + " requests sent Accept-Encoding: identity");
                     return pinned + "/" + total + " requests pinned identity";
                 }
+            }).ConfigureAwait(false);
+        }
+        /// <summary>
+        /// An origin that answers nothing at all for a few seconds, then recovers.
+        ///
+        /// This is the shape that killed two live streams on 2026-08-31. A DNS wobble made every
+        /// connect fail for at most 2.25 s, and the chunk gave up after 1.75-2.19 s - four
+        /// attempts at 250/500/1000 ms - while 28 of its 30 s stall budget went unspent. The
+        /// backoff was one step from clearing it: attempt 5 would have landed at ~3.75 s.
+        ///
+        /// The rule that fixes it: an attempt the origin never ANSWERED does not count against
+        /// MaxAttempts. That bound exists for a shape it is the only defence against (see the
+        /// trickle test below); "no answer" is what the stall budget is for, and the stall budget
+        /// is untouched here because nothing was ever published.
+        /// </summary>
+        private static async Task UnansweredBurstAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("an origin answering nothing for 4s is waited out, not failed", async () =>
+            {
+                using (MockServer srv = new MockServer(FileSize, fastContent: false))
+                {
+                    // Armed by the first request for chunk 1, so the probe and chunk 0 get through
+                    // and the outage lands on a stream that is already open and delivering - the
+                    // production shape. Wall-clock from that point: an outage is a property of
+                    // time, and nothing in the FaultHook signature carries it.
+                    long armedAt = 0;
+                    // Per-offset, not global. A global counter sums unrelated chunks, so it can
+                    // clear any threshold without a single chunk having survived more than one
+                    // drop - which is the only thing this test is about.
+                    System.Collections.Concurrent.ConcurrentDictionary<long, int> dropsAt =
+                        new System.Collections.Concurrent.ConcurrentDictionary<long, int>();
+                    srv.FaultHook = (seq, f, t) =>
+                    {
+                        if (f < 64 * 1024) return MockFault.None;          // probe + chunk 0
+                        long now = Environment.TickCount64;
+                        long prev = Interlocked.CompareExchange(ref armedAt, now, 0);
+                        if (now - (prev == 0 ? now : prev) >= 4000) return MockFault.None;
+                        dropsAt.AddOrUpdate(f, 1, (k, v) => v + 1);
+                        return MockFault.NoResponse;
+                    };
+                    try
+                    {
+                        ParallelFetchOptions o = Small();
+                        o.StallBudget = TimeSpan.FromSeconds(30);   // the documented bound must be the governing one
+                        o.ResponseHeadersTimeout = TimeSpan.FromMilliseconds(300);
+
+                        // Task.Run: OpenWith blocks its caller through the whole probe, so this
+                        // timeout is live only while the FaultHook happens to let the probe
+                        // through. One edit to that predicate would silently kill the bound.
+                        Fetched got = await Task.Run(() => FetchAsync(srv.Url, 0, 400000, o, ct))
+                                            .WaitAsync(TimeSpan.FromSeconds(60), ct).ConfigureAwait(false);
+                        Harness.AssertBytesEqual(Pattern.Range(0, 400000), got.Data, "bytes after the outage cleared");
+                        int worst = 0;
+                        foreach (int n in dropsAt.Values) if (n > worst) worst = n;
+                        Harness.Assert(worst > o.MaxAttempts,
+                            "the worst-hit chunk was dropped only " + worst + " times against MaxAttempts=" +
+                            o.MaxAttempts + "; the outage never outlasted the old bound, so this proves nothing");
+                        return "one chunk rode out " + worst + " unanswered attempts (MaxAttempts=" + o.MaxAttempts + ")";
+                    }
+                    finally { srv.FaultHook = null; }
+                }
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// The guard rail for the change above, and the one bound that has no substitute.
+        ///
+        /// A connection abandoned by the throughput floor publishes a SHORT block before it
+        /// throws - ChunkDownloader sets cursor.LastProgressTicks and only then throws
+        /// SlowConnectionException - which resets the stall budget. Against an origin that
+        /// trickles on EVERY attempt the stall budget can therefore never fire, and MaxAttempts
+        /// is structurally the only thing that stops the chunk. If anyone ever "simplifies" the
+        /// retry policy into a single time-based bound, this retries forever.
+        ///
+        /// Nothing covered this before: SlowConnectionAsync tests the RECOVERY shape, where only
+        /// the first attempt per chunk trickles.
+        /// </summary>
+        private static async Task TrickleAlwaysGivesUpAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("an origin trickling every attempt gives up, it does not loop", async () =>
+            {
+                using (MockServer srv = new MockServer(FileSize, fastContent: false))
+                {
+                    srv.TrickleBytesPerSec = 20000;
+                    System.Collections.Concurrent.ConcurrentDictionary<long, int> triesAt =
+                        new System.Collections.Concurrent.ConcurrentDictionary<long, int>();
+                    // Keyed on the range END, not the start. A trickling attempt publishes the
+                    // bytes it did manage, so the retry resumes at a new offset - keying on the
+                    // start would count every attempt as a different chunk and report 1.
+                    srv.FaultHook = (seq, f, t) =>
+                    {
+                        triesAt.AddOrUpdate(t, 1, (k, v) => v + 1);
+                        return MockFault.Trickle;                        // every attempt, forever
+                    };
+                    try
+                    {
+                        ParallelFetchOptions o = Small();
+                        o.MaxAttempts = 3;
+                        o.MinThroughputGrace = TimeSpan.FromMilliseconds(200);
+                        o.StallBudget = TimeSpan.FromSeconds(30);
+
+                        Stopwatch sw = Stopwatch.StartNew();
+                        bool threw = false;
+                        try
+                        {
+                            // WhenAny, not WaitAsync + catch(TimeoutException): the probe throws
+                            // TimeoutException when it gives up NORMALLY, so discriminating on the
+                            // type reports a correct give-up as a hang. Task.Run because OpenWith
+                            // would otherwise run the probe on this thread before any timer starts.
+                            Task<Fetched> run2 = Task.Run(() => FetchAsync(srv.Url, 0, 400000, o, ct));
+                            Task done = await Task.WhenAny(run2, Task.Delay(TimeSpan.FromSeconds(25), ct))
+                                                  .ConfigureAwait(false);
+                            if (done != run2)
+                            {
+                                throw new Exception("the chunk never gave up: MaxAttempts no longer bounds a " +
+                                                    "permanently trickling origin, and nothing else can");
+                            }
+                            await run2.ConfigureAwait(false);
+                        }
+                        catch (Exception) { threw = true; }
+                        sw.Stop();
+
+                        Harness.Assert(threw, "a permanently trickling origin was reported as success");
+                        Harness.Assert(sw.Elapsed.TotalSeconds < 20,
+                            "took " + sw.Elapsed.TotalSeconds.ToString("0.0") + "s to give up");
+
+                        // Pin the bound in BOTH directions. "It eventually threw" is satisfied by
+                        // any finite number, so it does not distinguish MaxAttempts=3 from 300;
+                        // and a chunk that gave up early would also throw, for the wrong reason.
+                        int worst = 0;
+                        foreach (int n in triesAt.Values) if (n > worst) worst = n;
+                        Harness.AssertEqual(o.MaxAttempts, worst,
+                            "a permanently trickling chunk made " + worst + " attempts against MaxAttempts=" +
+                            o.MaxAttempts + "; the answered-attempt counter is not the one being capped");
+                        return "gave up in " + sw.Elapsed.TotalSeconds.ToString("0.0") + "s at exactly " +
+                               worst + " answered attempts";
+                    }
+                    finally { srv.FaultHook = null; }
+                }
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// The other half of moving "unanswered" off MaxAttempts: something still has to stop it.
+        ///
+        /// Unanswered attempts no longer count against MaxAttempts, so for this shape the stall
+        /// budget is not a backstop - it is the ONLY bound in the system. Deleting it entirely
+        /// left the whole suite green, which means the suite was asserting that retries happen
+        /// without ever asserting that they end. Against an origin that accepts and then says
+        /// nothing, forever, that is an infinite loop wearing a retry policy's clothes.
+        ///
+        /// Armed after the first 64 KB so the probe and chunk 0 get through: this is about a
+        /// stream that is already open and delivering when the origin goes quiet, and it keeps
+        /// the probe's own (shorter) unanswered window out of the measurement.
+        /// </summary>
+        private static async Task StallBudgetStopsAnUnansweringOriginAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("an origin that never answers is stopped by the stall budget", async () =>
+            {
+                using (MockServer srv = new MockServer(FileSize, fastContent: false))
+                {
+                    srv.FaultHook = (seq, f, t) => f < 64 * 1024 ? MockFault.None : MockFault.NoResponse;
+                    try
+                    {
+                        ParallelFetchOptions o = Small();
+                        o.StallBudget = TimeSpan.FromSeconds(3);
+                        o.ResponseHeadersTimeout = TimeSpan.FromMilliseconds(300);
+
+                        Stopwatch sw = Stopwatch.StartNew();
+                        string message = null;
+                        try
+                        {
+                            // WhenAny for the same reason as above: a normal give-up is also a
+                            // TimeoutException, so the type cannot be the hang discriminator.
+                            Task<Fetched> run3 = Task.Run(() => FetchAsync(srv.Url, 0, 400000, o, ct));
+                            Task done = await Task.WhenAny(run3, Task.Delay(TimeSpan.FromSeconds(25), ct))
+                                                  .ConfigureAwait(false);
+                            if (done != run3)
+                            {
+                                throw new Exception("the chunk retried for 25s against an origin that answers " +
+                                                    "nothing: with unanswered attempts off MaxAttempts, the stall " +
+                                                    "budget is the only bound left and it is not firing");
+                            }
+                            await run3.ConfigureAwait(false);
+                        }
+                        catch (Exception ex) { message = ex.Message; }
+                        sw.Stop();
+
+                        Harness.Assert(message != null, "an origin that never answered was reported as success");
+                        // Quote the configured number, not just the reason. ChunkDownloader already
+                        // formats stallBudgetMs into this message, so a floor or a multiplier
+                        // applied to the budget is caught by the string alone - which "it
+                        // terminated eventually" cannot do at any threshold.
+                        Harness.Assert(message.Contains("made no progress for 3000 ms"),
+                            "gave up for the wrong reason, or not on the configured budget: " + message);
+                        // A band, not a ceiling. `< 15` against a 3s budget is 5x slack: a mutant
+                        // flooring the budget at 10s gave up in 10.0s and this test PASSED,
+                        // printing "stopped after 10.0s on a 3s stall budget".
+                        Harness.Assert(sw.Elapsed.TotalSeconds > 2.5 && sw.Elapsed.TotalSeconds < 6,
+                            "a 3s stall budget produced a " + sw.Elapsed.TotalSeconds.ToString("0.0") +
+                            "s give-up");
+                        return "stopped after " + sw.Elapsed.TotalSeconds.ToString("0.0") + "s on a 3s stall budget";
+                    }
+                    finally { srv.FaultHook = null; }
+                }
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// The probe is chunk 0 and blocks a host request thread, so it has its own retry loop -
+        /// and on 2026-08-31 it gave up on the same DNS wobble four times, each one logging
+        /// FALLBACK and handing the whole film to Emby's single connection at 4.1 Mbps against a
+        /// 13 Mbps requirement. Falling back is right when the origin cannot serve us; it is
+        /// wrong when the origin is two seconds from being fine.
+        /// </summary>
+        private static async Task ProbeRidesOutUnansweredBurstAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("the probe waits out a short outage instead of falling back", async () =>
+            {
+                using (MockServer srv = new MockServer(FileSize, fastContent: false))
+                {
+                    Stopwatch outage = Stopwatch.StartNew();
+                    // Count only offset 0. A global counter sums the probe with every chunk
+                    // worker, so the number reported as "the probe survived N attempts" was not
+                    // the probe's. Nothing but the probe can request offset 0 during the outage:
+                    // chunk 0 does not start until the probe has succeeded.
+                    int dropped = 0;
+                    srv.FaultHook = (seq, f, t) =>
+                    {
+                        if (outage.ElapsedMilliseconds >= 4000) return MockFault.None;
+                        if (f == 0) Interlocked.Increment(ref dropped);
+                        return MockFault.NoResponse;
+                    };
+                    try
+                    {
+                        ParallelFetchOptions o = Small();
+                        o.StallBudget = TimeSpan.FromSeconds(30);
+                        o.ResponseHeadersTimeout = TimeSpan.FromMilliseconds(300);
+
+                        // OpenWith, not TryOpen: TryOpen turns the failure into a null, so this
+                        // test would "pass" by falling back - which is the thing it forbids.
+                        // Task.Run is load-bearing: OpenWith blocks its caller for the whole probe
+                        // (Open() is synchronous by construction), so calling FetchAsync directly
+                        // would run the probe on THIS thread and .WaitAsync would only start
+                        // counting after it had already returned - a timeout that cannot fire.
+                        Fetched got = await Task.Run(() => FetchAsync(srv.Url, 0, 200000, o, ct))
+                                            .WaitAsync(TimeSpan.FromSeconds(30), ct).ConfigureAwait(false);
+                        Harness.AssertBytesEqual(Pattern.Range(0, 200000), got.Data, "bytes after the probe recovered");
+                        Harness.Assert(Volatile.Read(ref dropped) >= 4,
+                            "only " + dropped + " requests were dropped, so the outage did not outlast the " +
+                            "old 4-attempt window");
+                        return "probe survived " + dropped + " unanswered attempts";
+                    }
+                    finally { srv.FaultHook = null; }
+                }
+            }).ConfigureAwait(false);
+        }
+
+
+
+        /// <summary>
+        /// The probe's wall-clock bound, asserted against every shape that can consume it rather
+        /// than against one convenient shape.
+        ///
+        /// This exists because the first version of the bound was a SECOND deadline layered on
+        /// the stall budget and checked only at the top of the retry loop, while every actual
+        /// wait inside the loop went on clamping to the 30 s stall budget. The single test
+        /// covering it aimed at a closed port - connect-refused, which fails in microseconds -
+        /// so it passed while three other shapes drove straight through:
+        ///
+        ///   accepts, never replies   -> header timeout clamped to 30 s, not to the window: 20.0 s
+        ///   answers once, then quiet -> one answer disabled the window for good:            30.0 s
+        ///   budget fully committed   -> the permit wait had its own 30 s bound:             30.0 s
+        ///
+        /// All three pinned a synchronously-blocked Emby request thread for the whole duration.
+        /// Each row below is one of them. The invariant is deliberately stated once, over a
+        /// table: the bound is a property of the probe, not of any particular failure.
+        /// </summary>
+        private static async Task ProbeBudgetHoldsWhateverTheOriginDoesAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("the probe's time bound holds for every shape, not just the fast one", async () =>
+            {
+                string[] names = { "accepts and never replies", "answers once then goes quiet", "budget fully committed" };
+                List<string> results = new List<string>();
+
+                for (int shape = 0; shape < names.Length; shape++)
+                {
+                    using (MockServer srv = new MockServer(FileSize, fastContent: false))
+                    {
+                        OriginBudget.ResetForTests();
+                        ParallelFetchOptions o = shape == 2 ? Budgeted(connections: 1, budget: 1) : Small();
+                        o.StallBudget = TimeSpan.FromSeconds(30);
+
+                        if (shape == 0)
+                        {
+                            // The DEFAULT-scale header timeout, on purpose. A single attempt must
+                            // not be able to outlast the whole probe budget; clamping the header
+                            // wait to the stall budget instead of to the probe budget is exactly
+                            // what let one attempt eat 20 s.
+                            o.ResponseHeadersTimeout = TimeSpan.FromSeconds(20);
+                            srv.FaultHook = (seq, f, t) => MockFault.NoResponse;
+                        }
+                        else if (shape == 1)
+                        {
+                            o.ResponseHeadersTimeout = TimeSpan.FromMilliseconds(200);
+                            srv.FaultHook = (seq, f, t) => seq == 1 ? MockFault.Status500 : MockFault.NoResponse;
+                        }
+                        else
+                        {
+                            o.ResponseHeadersTimeout = TimeSpan.FromMilliseconds(200);
+                        }
+
+                        OriginBudget.Permit hog = null;
+                        try
+                        {
+                            if (shape == 2)
+                            {
+                                hog = await OriginBudget.TryAcquireAsync(OriginBudget.KeyFor(srv.Url), 1,
+                                                TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+                                Harness.Assert(hog != null, "could not take the only permit to saturate the budget");
+                            }
+
+                            Stopwatch sw = Stopwatch.StartNew();
+                            bool gaveUp = false;
+
+                            // WhenAny rather than WaitAsync, because "did it return?" must not be
+                            // discriminated by exception TYPE here: WaitAsync signals its own
+                            // timeout with TimeoutException, and so does the probe when it gives
+                            // up normally. Catching TimeoutException therefore reported a correct
+                            // give-up as a hang - which is how a mutant run first surfaced this.
+                            // Task.Run is load-bearing too: OpenWith blocks its caller for the
+                            // whole probe, so a bare await would run it on this thread.
+                            Task<Fetched> open = Task.Run(() => FetchAsync(srv.Url, 0, 200000, o, ct));
+                            Task done = await Task.WhenAny(open, Task.Delay(TimeSpan.FromSeconds(45), ct))
+                                                  .ConfigureAwait(false);
+                            if (done != open) throw new Exception(names[shape] + ": the probe never returned at all");
+                            string why = null;
+                            try { await open.ConfigureAwait(false); }
+                            catch (Exception ex) { gaveUp = true; why = ex.Message; }
+                            sw.Stop();
+
+                            Harness.Assert(gaveUp, names[shape] + ": reported success against an origin that never served");
+
+                            // The diagnosis, on the paths that actually produce it. These three
+                            // shapes all give up from inside the CATCH block, where the code used
+                            // to rethrow whatever exception was in flight - so the FALLBACK line,
+                            // the only record a running Emby keeps of why a stream went
+                            // single-connection, read "The operation was canceled." The
+                            // connect-refused test in LoggingTests cannot cover this: it fails
+                            // fast enough to exit through the top-of-loop check instead, which
+                            // always had the good message.
+                            Harness.Assert(why != null && why.Contains("Probe gave up on"),
+                                names[shape] + ": gave up without saying so - the fallback reason will be " +
+                                "whatever exception happened to be in flight: " + why);
+                            Harness.Assert(sw.Elapsed.TotalSeconds < 11,
+                                names[shape] + ": pinned the calling thread for " +
+                                sw.Elapsed.TotalSeconds.ToString("0.0") + "s; the probe budget is 8s and every " +
+                                "wait inside the retry loop is supposed to be clamped by it");
+                            results.Add(names[shape] + " " + sw.Elapsed.TotalSeconds.ToString("0.0") + "s");
+                        }
+                        finally { if (hog != null) hog.Dispose(); srv.FaultHook = null; }
+                    }
+                }
+                return string.Join(", ", results);
             }).ConfigureAwait(false);
         }
 

@@ -38,6 +38,55 @@ namespace EmbyStrmParallel.Tests
         {
             Harness.Section("routing configuration");
 
+            await Harness.RunAsync("the probe sizes its waits from its own budget, not the chunk loop's", async () =>
+            {
+                // Arithmetic, asserted as arithmetic. The integration test for this lives in
+                // LoggingTests and can only see the difference as one retry more or fewer, which
+                // CPU contention erases - it was measured 19% flaky while still not separating its
+                // own mutant. Two numbers, no clock, no origin.
+                ParallelFetchOptions o = new ParallelFetchOptions();
+                o.StallBudget = TimeSpan.FromSeconds(30);
+                o.RetryMaxDelayMs = 4000;
+                o.RetryBaseDelayMs = 250;
+
+                Harness.AssertEqual(8000, (int)ParallelFetch.ProbeBudgetMs(o), "probe budget at a 30s stall budget");
+
+                // The whole point: NOT RetryMaxDelayMs. A single 4s wait cannot fit in the tail of
+                // an 8s budget, so inheriting it makes the probe give up at ~4.1s having used half
+                // its budget and skipped the attempts that ride out a wobble.
+                Harness.AssertEqual(2000, ParallelFetch.ProbeMaxDelayMs(o), "probe backoff ceiling");
+                Harness.Assert(ParallelFetch.ProbeMaxDelayMs(o) < o.RetryMaxDelayMs,
+                    "the probe inherited the chunk loop's backoff ceiling");
+
+                // A short stall budget shrinks both, and neither may reach zero or invert.
+                o.StallBudget = TimeSpan.FromMilliseconds(400);
+                Harness.AssertEqual(400, (int)ParallelFetch.ProbeBudgetMs(o), "probe budget below the 8s cap");
+                Harness.Assert(ParallelFetch.ProbeMaxDelayMs(o) >= 1, "backoff ceiling collapsed to zero");
+
+                // The containment that matters. RetryBaseDelayMs clamps to 10000, well above the
+                // 8000ms budget, and a usable-remainder floor larger than the budget makes the
+                // probe give up having made ZERO requests - every TryOpen null, every stream at
+                // 4.1 Mbps, forever. Measured exactly that before the Math.Min went in.
+                // Both sides of that Math.Min, because only one of them was pinned. Dropping the
+                // RetryBaseDelayMs side entirely - leaving Math.Max(1, budget/4) - survived all 34
+                // tests: it raises the floor from 250ms to 2000ms, so the probe gives up with 2s
+                // of its 8s budget unspent and one fewer attempt made. "Converges" is not the
+                // property; being a no-op at the defaults is, since that is the whole reason the
+                // Math.Min was added rather than replacing the knob outright.
+                Harness.AssertEqual(250, ParallelFetch.UsableRemainderMs(new ParallelFetchOptions()),
+                    "the containment must be a no-op at the defaults; the floor is still RetryBaseDelayMs");
+
+                o.StallBudget = TimeSpan.FromSeconds(30);
+                o.RetryBaseDelayMs = 10000;
+                Harness.Assert(ParallelFetch.UsableRemainderMs(o) < ParallelFetch.ProbeBudgetMs(o),
+                    "the minimum remainder needed to start an attempt (" + ParallelFetch.UsableRemainderMs(o) +
+                    "ms) exceeds the probe's entire budget (" + ParallelFetch.ProbeBudgetMs(o) +
+                    "ms), so the probe can never make one");
+
+                await Task.CompletedTask;
+                return "budget 8000ms, backoff ceiling 2000ms, remainder floor contained";
+            }).ConfigureAwait(false);
+
             await Harness.RunAsync("no configuration anywhere -> never matches", async () =>
             {
                 ClearEnv();

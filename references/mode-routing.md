@@ -160,7 +160,8 @@ dead. Never take a permit for anything longer-lived than one attempt.
 
 **Declining is a deliberate outcome, not a failure.** The probe *is* chunk 0, so it takes a permit
 like any other request, but with a bound: `Open()` blocks a host request thread, so it cannot wait
-forever. If the origin's budget is fully committed the probe gives up, `TryOpen` returns null, and
+forever — the cap is `min(StallBudget, 8s)`, not the stall budget itself, and it covers the whole
+probe rather than any single wait inside it. If the origin's budget is fully committed the probe gives up, `TryOpen` returns null, and
 Emby serves that request over its own single connection — slower, correct, and written to the log.
 That is strictly better than queuing for a permit that may never arrive.
 
@@ -414,9 +415,15 @@ does not have to re-derive the reasoning:
 - **Per-prefix budget values.** Today one global value is applied to each authority separately,
   which already covers "two providers must not contend". Only "provider A tolerates 20 while B
   tolerates 12" needs per-prefix values, and that wants a second origin's measurements first.
-- **The probe blocks a host request thread** for up to the stall budget (30s). This follows from
-  the injection point: patch C returns `Task.FromResult` before the async state machine starts,
-  so making the probe asynchronous means injecting a continuation. Not a small change.
+- **The probe blocks a host request thread** for up to `ParallelFetch.ProbeBudgetMs`, which is
+  `min(StallBudget, 8s)` and is deliberately not configurable. This follows from the injection
+  point: patch C returns `Task.FromResult` before the async state machine starts, so making the
+  probe asynchronous means injecting a continuation. Not a small change. That one deadline bounds
+  every wait the probe makes — queuing for a permit, waiting for response headers, sleeping a
+  backoff — because giving any of them a bound of its own is a bound somebody has to remember to
+  keep in step, and the ones that fell out of step held a host thread for 20-30s each. The price
+  is that an origin needing more than 8s just to send response headers never gets parallel mode;
+  by then playback was not going to work anyway.
 - **Emby's `StaticFileResultOptions.RequestHeaders` are not forwarded** to the origin. Signed
   URLs carry their own authorisation, and an origin that needs more answers 401/403 → retry →
   fallback, which is a *loud* failure rather than a silent one.

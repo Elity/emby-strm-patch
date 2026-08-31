@@ -15,7 +15,19 @@ namespace EmbyStrmParallel.Tests
         Status503RetryAfter,   // 503 carrying the server's own Retry-After instruction
         TruncateHalf,   // announce the full length, send half, reset the connection
         Trickle,        // technically succeeds, but far too slow to be usable
-        IgnoreRange     // answer 200 with the whole resource
+        IgnoreRange,    // answer 200 with the whole resource
+        /// <summary>
+        /// Accept the request and never answer it, so the client's own header timeout is what
+        /// ends the attempt and NO response object ever exists on its side.
+        ///
+        /// Every other fault here answers with something, which left the whole "the origin did
+        /// not reply" class uncovered - and that is exactly the class that killed two live
+        /// streams on 2026-08-31 (a DNS wobble; connect failures and resets land on the same
+        /// client-side branch). `Response.Abort()` is no good for this: before any bytes are
+        /// written HttpListener still emits a bare 200, which the fetcher reads as "the origin
+        /// ignored Range" - a completely different path.
+        /// </summary>
+        NoResponse
     }
 
     /// <summary>
@@ -203,6 +215,15 @@ namespace EmbyStrmParallel.Tests
                 Func<int, long, long, MockFault> hook = FaultHook;
                 if (hook != null) fault = hook(seq, from, to);
 
+                if (fault == MockFault.NoResponse)
+                {
+                    // Hold the connection open and answer nothing. Bounded by the server's own
+                    // token so Dispose still tears these down.
+                    try { await Task.Delay(TimeSpan.FromMinutes(5), _cts.Token).ConfigureAwait(false); }
+                    catch { }
+                    try { ctx.Response.Abort(); } catch { }
+                    return;
+                }
                 if (fault == MockFault.Status403) { ctx.Response.StatusCode = 403; ctx.Response.Close(); return; }
                 if (fault == MockFault.Status500) { ctx.Response.StatusCode = 500; ctx.Response.Close(); return; }
                 if (fault == MockFault.Status503RetryAfter)

@@ -185,9 +185,46 @@ namespace EmbyStrmParallel
                     catch (Exception ex)
                     {
                         Interlocked.Exchange(ref _faulted, 1);
+
+                        // Snapshot BEFORE poisoning the channel, and the order is the whole point.
+                        // TryComplete(ex) is what wakes the reader; the reader rethrows, the host
+                        // disposes the stream, Dispose cancels _cts. All of that can happen before
+                        // the line below runs, so reading the flag afterwards lets a genuine
+                        // failure suppress its own log entry through a teardown it caused itself -
+                        // and it would be the only FAILED line that stream ever had.
+                        bool teardown = _cts.IsCancellationRequested;
+
                         // Poison the channel: the reader re-throws this instead of seeing a short read.
                         chan.Writer.TryComplete(ex);
-                        FetchLog.Write(_tag + " chunk " + index + " [" + start + "-" + end + "] FAILED: " + FetchLog.Describe(ex));
+
+                        // Only log a chunk that failed on its own merits. A stream being torn
+                        // down cancels every chunk still in flight BY DESIGN - that is what a
+                        // seek is - and logging each one produced 231 lines of "FAILED" against
+                        // 12 real failures in a single evening, which buried the real ones badly
+                        // enough that finding them needed a grep -v.
+                        //
+                        // The discriminator is the token, NOT the exception type. Dispose cancels,
+                        // then disposes the HttpClient, then completes every slot writer, so by
+                        // construction a worker caught mid-flight can surface
+                        // ChannelClosedException, ObjectDisposedException, IOException or
+                        // HttpRequestException instead of a cancellation - all of them rethrown
+                        // raw by the `if (ct.IsCancellationRequested) throw;` gate in
+                        // ChunkDownloader, which does not look at the type either.
+                        //
+                        // Honesty about the evidence: cancellation is observed to win that race in
+                        // practice, and swapping this for `ex is OperationCanceledException`
+                        // survives the whole suite. The token is still the right discriminator -
+                        // it states the question being asked ("is this stream being torn down?")
+                        // rather than guessing which of five exceptions won a race - but the
+                        // narrower filter is not known to be wrong, only to be a guess.
+                        //
+                        // Nothing real is lost either way: a genuine give-up is always an IOException
+                        // ("failed after N attempt(s)" or "made no progress for N ms"), and the
+                        // closing line already reports ABANDONED and chunks=A/B.
+                        if (!teardown)
+                        {
+                            FetchLog.Write(_tag + " chunk " + index + " [" + start + "-" + end + "] FAILED: " + FetchLog.Describe(ex));
+                        }
                         return;
                     }
                 }

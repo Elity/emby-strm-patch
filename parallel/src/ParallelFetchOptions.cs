@@ -139,16 +139,44 @@ namespace EmbyStrmParallel
         /// <summary>Granularity of hand-off between workers and the reader. Kept under the LOH threshold.</summary>
         public int BlockSize { get; set; } = 64 * 1024;
 
-        /// <summary>Total attempts per chunk (1 = no retry).</summary>
+        /// <summary>
+        /// Attempts per chunk that the origin ANSWERED, before the chunk is failed.
+        ///
+        /// The scope of that sentence is the whole point. This bound exists for one shape and one
+        /// shape only: a connection the throughput floor keeps abandoning. That shape publishes a
+        /// short block before it throws, which resets the stall budget, so the stall budget can
+        /// never fire on it - MaxAttempts is structurally its only brake. Do not "simplify" the
+        /// retry policy down to a single time-based bound; a permanently trickling origin would
+        /// then retry forever. There is a test named for exactly this.
+        ///
+        /// It deliberately does NOT bound attempts the origin never answered - DNS failures,
+        /// refused connects, header timeouts. Those are what StallBudget was built for, and it
+        /// works on them precisely because nothing was published for it to reset against. Letting
+        /// this counter cap them too was a real outage: four attempts at 250/500/1000 ms give up
+        /// 1.75-2.19 s in, and on 2026-08-31 two live streams died on DNS wobbles that never
+        /// lasted past 2.25 s, with 28 of the 30 s stall budget unspent.
+        /// </summary>
         public int MaxAttempts { get; set; } = 4;
 
         /// <summary>Base for exponential retry backoff.</summary>
         public int RetryBaseDelayMs { get; set; } = 250;
 
-        /// <summary>Cap for exponential retry backoff.</summary>
+        /// <summary>
+        /// Cap for exponential retry backoff. Chunk workers use it as written; the open-time probe
+        /// caps itself at a quarter of its own (much shorter) budget instead, because a single 4 s
+        /// wait cannot fit in the tail of an 8 s one. See ParallelFetch.ProbeBudgetMs.
+        /// </summary>
         public int RetryMaxDelayMs { get; set; } = 4000;
 
-        /// <summary>Budget for "request sent -> response headers received" on a single attempt.</summary>
+        /// <summary>
+        /// Budget for "request sent -> response headers received" on a single attempt.
+        ///
+        /// Chunk workers get this in full. The open-time probe does not: every wait it makes is
+        /// clamped to ParallelFetch.ProbeBudgetMs (8 s), because the probe blocks an Emby request
+        /// thread and its failure is a graceful degrade rather than an error. An origin that needs
+        /// more than 8 s just to send response headers therefore falls back to the host path, and
+        /// that is deliberate and NOT configurable - by then playback was not going to work.
+        /// </summary>
         public TimeSpan ResponseHeadersTimeout { get; set; } = TimeSpan.FromSeconds(20);
 
         /// <summary>Budget for "no bytes arrived on an open body". Rescheduled on every successful read.</summary>
@@ -265,7 +293,10 @@ namespace EmbyStrmParallel
                 o.ConnectionsClampedByBudget = true;
             }
             o.MaxAttempts = Clamp(o.MaxAttempts, 1, 16);
-            o.RetryBaseDelayMs = Clamp(o.RetryBaseDelayMs, 0, 10000);
+            // Floor of 1, not 0. At 0 the backoff is 0, RetryDelayMs returns 0, the caller skips
+            // its Task.Delay entirely, and the retry loop becomes a hot loop bounded only by wall
+            // clock - which against a fast-failing origin is thousands of connects a second.
+            o.RetryBaseDelayMs = Clamp(o.RetryBaseDelayMs, 1, 10000);
             o.RetryMaxDelayMs = Clamp(o.RetryMaxDelayMs, o.RetryBaseDelayMs, 60000);
             if (o.MaxBufferBytes < o.ChunkSize) o.MaxBufferBytes = o.ChunkSize;
             // Also bound from above, for options built in code rather than read from the file:
