@@ -238,22 +238,23 @@ namespace EmbyStrmParallel.Tests
                         "the probe made " + probeRetries + " retries against a dead origin; the backoff is " +
                         "not growing, so this is a hot loop rather than a retry policy");
 
-                    // A collapse smoke test, and deliberately nothing finer.
+                    // There is deliberately NO lower bound on the count, and the reason is worth
+                    // recording because two attempts at one were wrong in different ways.
                     //
-                    // The property worth pinning here - the probe caps its backoff at a quarter of
-                    // its own budget rather than inheriting RetryMaxDelayMs - separates the correct
-                    // and broken shapes by exactly ONE attempt (6 vs 5). A stopwatch cannot resolve
-                    // that: under CPU contention an oversleeping Task.Delay costs the CORRECT shape
-                    // an attempt too, measured at 4 failures in 21 loaded runs, with correct-code
-                    // counts of 4 and 5 landing inside the broken shape's band. An assertion that
-                    // is 19% flaky AND cannot separate its own mutant is worse than none.
+                    // The property it kept reaching for - the probe caps its backoff at a quarter
+                    // of its own budget rather than inheriting RetryMaxDelayMs - separates correct
+                    // from broken by exactly ONE attempt (6 vs 5) on this machine. A stopwatch
+                    // cannot resolve that (CPU contention costs the CORRECT shape an attempt too:
+                    // 4 failures in 21 loaded runs), and neither can the count, because the count
+                    // is not portable: on Windows a connect to a refused port costs real time
+                    // rather than microseconds, so the same correct code fits 3 cycles into the
+                    // budget where Linux and macOS fit 6. CI found that; six local review rounds
+                    // did not.
                     //
-                    // That arithmetic is pinned deterministically in ConfigTests instead, against
-                    // ParallelFetch.ProbeMaxDelayMs. What stays here is the thing only an
-                    // end-to-end run can see: the retry loop is running at all.
-                    Harness.Assert(probeRetries >= 4,
-                        "the probe managed only " + probeRetries + " retries in its whole budget; the retry " +
-                        "loop has collapsed rather than merely mis-tuned");
+                    // So the arithmetic is pinned where it is actually arithmetic - ConfigTests,
+                    // against ParallelFetch.ProbeMaxDelayMs, no clock and no origin - and what is
+                    // left here is only what an end-to-end run can honestly claim: the loop ran,
+                    // it was not a hot loop, and it spent about the budget it was given.
 
                     await Task.CompletedTask;
                     return probeRetries + " retries, gave up in " + sw.Elapsed.TotalSeconds.ToString("0.0") + "s";
