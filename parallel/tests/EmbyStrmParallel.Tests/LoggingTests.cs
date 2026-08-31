@@ -37,6 +37,35 @@ namespace EmbyStrmParallel.Tests
             return dir;
         }
 
+        /// <summary>
+        /// Reads the log while the writer may still have the file open.
+        ///
+        /// `File.ReadAllText` asks for exclusive-ish sharing, which Windows enforces and Unix does
+        /// not - so a test that reads the log promptly after tearing a stream down passed on
+        /// macOS and Linux and failed on Windows only. The fetcher keeps writing as its workers
+        /// unwind after Dispose (that is exactly what the budget diagnostics are for), so the
+        /// race is inherent to reading a live log rather than a quirk of one test.
+        /// </summary>
+        private static string ReadLog(string path)
+        {
+            for (int attempt = 0; ; attempt++)
+            {
+                try
+                {
+                    using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read,
+                                                          FileShare.ReadWrite | FileShare.Delete))
+                    using (StreamReader r = new StreamReader(fs))
+                    {
+                        return r.ReadToEnd();
+                    }
+                }
+                catch (IOException) when (attempt < 20)
+                {
+                    Thread.Sleep(50);
+                }
+            }
+        }
+
         private static void Arm(string path)
         {
             Environment.SetEnvironmentVariable(FetchLog.PathVariable, path);
@@ -87,7 +116,7 @@ namespace EmbyStrmParallel.Tests
                         }
                     }
                     Harness.Assert(File.Exists(logPath), "log file was not created at " + logPath);
-                    string text = File.ReadAllText(logPath);
+                    string text = ReadLog(logPath);
                     Harness.Assert(text.Contains("path=parallel"), "no parallel-path line: " + text);
                     Harness.Assert(text.Contains("offset=4096"), "offset missing: " + text);
                     Harness.Assert(text.Contains("length=200000"), "length missing: " + text);
@@ -121,7 +150,7 @@ namespace EmbyStrmParallel.Tests
                         {
                             await Harness.ReadAllAsync(s, 32 * 1024, ct).ConfigureAwait(false);
                         }
-                        string text = File.ReadAllText(logPath);
+                        string text = ReadLog(logPath);
                         Harness.Assert(!text.Contains(secret), "the signature leaked into the log");
                         Harness.Assert(!text.Contains("sig="), "the query string leaked into the log");
                         Harness.Assert(text.Contains("?<redacted>"), "the query should be marked as redacted: " + text);
@@ -157,7 +186,7 @@ namespace EmbyStrmParallel.Tests
                     Harness.Assert(s == null, "TryOpen should return null on failure");
                     Harness.Assert(t == null && cl == null, "out params must be null on failure");
                     Harness.Assert(File.Exists(logPath), "no log file was written for the fallback");
-                    string text = File.ReadAllText(logPath);
+                    string text = ReadLog(logPath);
                     Harness.Assert(text.Contains("FALLBACK to host path"), "fallback not logged: " + text);
                     Harness.Assert(text.Contains("reason="), "no reason recorded: " + text);
                     Harness.Assert(text.Contains("offset=0"), "offset missing: " + text);
@@ -187,7 +216,7 @@ namespace EmbyStrmParallel.Tests
                             byte[] got = await Harness.ReadAllAsync(s, 32 * 1024, ct).ConfigureAwait(false);
                             Harness.AssertBytesEqual(Pattern.Range(0, 500000), got, "bytes still exact");
                         }
-                        string text = File.ReadAllText(logPath);
+                        string text = ReadLog(logPath);
                         Harness.Assert(text.Contains("HTTP 403"), "403 status not recorded: " + text);
                         Harness.Assert(text.Contains("retry"), "no retry line: " + text);
                         Harness.Assert(text.Contains("resuming at"), "resume offset not recorded: " + text);
@@ -220,7 +249,7 @@ namespace EmbyStrmParallel.Tests
                         await s2.ReadAsync(tiny.AsMemory(0, tiny.Length), ct).ConfigureAwait(false);
                         s2.Dispose();
 
-                        string text = File.ReadAllText(logPath);
+                        string text = ReadLog(logPath);
                         Harness.Assert(text.Contains("closed complete"), "no completion summary: " + text);
                         Harness.Assert(text.Contains("closed ABANDONED"), "no abandonment summary: " + text);
                         foreach (string field in new string[] { "delivered=", "elapsed=", "rate=", "chunks=", "retries=", "slow=", "permitWait=" })
@@ -283,7 +312,7 @@ namespace EmbyStrmParallel.Tests
                         for (int i = 0; i < 60 && OriginBudget.InUse(key) != 0; i++)
                             await Task.Delay(50, ct).ConfigureAwait(false);
 
-                        string text = File.ReadAllText(logPath);
+                        string text = ReadLog(logPath);
                         string summary = null;
                         foreach (string l in text.Trim().Split('\n')) if (l.Contains(" closed ")) summary = l;
                         Harness.Assert(summary != null, "no close summary at all: " + text);
@@ -345,7 +374,7 @@ namespace EmbyStrmParallel.Tests
                         await Task.Delay(800, ct).ConfigureAwait(false);
                         s.Dispose();                    // budget still tied up: workers are queued
 
-                        string text = File.ReadAllText(logPath);
+                        string text = ReadLog(logPath);
                         string summary = null;
                         foreach (string l in text.Trim().Split('\n')) if (l.Contains(" closed ")) summary = l;
                         Harness.Assert(summary != null, "no close summary at all: " + text);
@@ -387,7 +416,7 @@ namespace EmbyStrmParallel.Tests
                             Harness.AssertBytesEqual(Pattern.Range(0, 300000), got, "bytes under a clamped config");
                         }
 
-                        string text = File.ReadAllText(logPath);
+                        string text = ReadLog(logPath);
                         string open = null;
                         foreach (string l in text.Trim().Split('\n')) if (l.Contains("open path=parallel")) open = l;
                         Harness.Assert(open != null, "no open line at all: " + text);
