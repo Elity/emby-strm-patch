@@ -9,4 +9,11 @@
   <ItemGroup>
     <PackageReference Include="Mono.Cecil" Version="0.11.6" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- The third compilation of the one routing parser (template/ and parallel/src/ are the
+         other two). `embypatch check` MUST agree with the runtime about what a config line
+         means, and the only way to guarantee that is to run the same source. See the header of
+         shared/RoutingConfig.cs and references/mode-routing.md 4.1 / 5. -->
+    <Compile Include="../shared/RoutingConfig.cs" Link="RoutingConfig.cs" />
+  </ItemGroup>
 </Project>

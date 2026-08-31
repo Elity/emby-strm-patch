@@ -62,8 +62,7 @@ void ResetMatchers()
     foreach (var a in new[] { rAsm, nAsm })
     {
         var t = a.GetType("Emby.Server.StrmDirect.StrmDirect", true)!;
-        t.GetField("_prefixes", BindingFlags.Static | BindingFlags.NonPublic)!.SetValue(null, null);
-        t.GetField("_nextReload", BindingFlags.Static | BindingFlags.NonPublic)!.SetValue(null, 0L);
+        t.GetMethod("InvalidateCache", BindingFlags.Static | BindingFlags.NonPublic)!.Invoke(null, null);
     }
 }
 
@@ -97,13 +96,32 @@ catch (Exception e) { Check("null MediaSourceInfo does not throw: " + (e.InnerEx
 
 Console.WriteLine("\n4) config file is honoured");
 Environment.SetEnvironmentVariable("EMBY_STRM_PREFIXES", null);
-var cfg = Path.Combine(Path.GetTempPath(), "strm-direct-behaviour.txt");
+var cfg = Path.Combine(Path.GetTempPath(), "strm-routing-behaviour.txt");
 File.WriteAllText(cfg, "# comment\n\n  https://from-file.example/  \n");
 Environment.SetEnvironmentVariable("EMBY_STRM_CONFIG", cfg);
 ResetMatchers();
 Check("file prefix redirects", Serve("https://from-file.example/x.mkv"), "REDIRECT:https://from-file.example/x.mkv");
 Check("file prefix disables transcoding", SupportsTranscodingAfter("https://from-file.example/x.mkv"), false);
 Check("other url unaffected", Serve("https://pan.example.com/d/a.mkv"), "STREAM:https://pan.example.com/d/a.mkv");
+
+Console.WriteLine("\n5) patch A covers every mode - transcoding would defeat both of them");
+File.WriteAllText(cfg, "https://par.example/   parallel\nhttps://typo.example/  paralell\n");
+ResetMatchers();
+Check("a parallel prefix still loses transcoding", SupportsTranscodingAfter("https://par.example/a.mkv"), false);
+Check("a line with a misspelled mode is void, not a match", SupportsTranscodingAfter("https://typo.example/a.mkv"), true);
+
+// Patch B asks IsRedirect, not IsMatch (references/mode-routing.md 4). This is what makes one binary
+// able to carry B and C at once: a prefix routed to parallel must reach GetContent, and it only
+// gets there if GetStaticFileResult declines to redirect it. If B ever regressed to IsMatch,
+// every parallel prefix would silently become a 302 - the mode switch would look configured and
+// do nothing, which is the failure this whole design exists to prevent.
+Console.WriteLine("\n6) patch B redirects only the 302 mode");
+File.WriteAllText(cfg, "https://redir.example/    302\nhttps://par.example/      parallel\nhttps://plain.example/\nhttps://typo.example/     paralell\n");
+ResetMatchers();
+Check("explicit 302 prefix redirects", Serve("https://redir.example/a.mkv"), "REDIRECT:https://redir.example/a.mkv");
+Check("bare prefix defaults to 302 and redirects", Serve("https://plain.example/a.mkv"), "REDIRECT:https://plain.example/a.mkv");
+Check("parallel prefix is NOT redirected", Serve("https://par.example/a.mkv"), "STREAM:https://par.example/a.mkv");
+Check("misspelled mode is not redirected either", Serve("https://typo.example/a.mkv"), "STREAM:https://typo.example/a.mkv");
 File.Delete(cfg);
 
 Console.WriteLine($"\n{(fail == 0 ? "ALL PASS" : "FAILURES")}   pass={pass} fail={fail}");

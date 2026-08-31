@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>EmbyStrmParallel</AssemblyName>
+    <RootNamespace>EmbyStrmParallel</RootNamespace>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <!-- BCL only: this project intentionally has zero PackageReference entries. -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="EmbyStrmParallel.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- One parser, two products. template/ compiles this very same file and the patcher clones
+         it into Emby; see the header of shared/RoutingConfig.cs and references/mode-routing.md 4.1. -->
+    <Compile Include="../../shared/RoutingConfig.cs" Link="RoutingConfig.cs" />
+  </ItemGroup>
+
+</Project>

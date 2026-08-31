@@ -16,15 +16,27 @@ AppDomain.CurrentDomain.AssemblyResolve += (_, e) => {
 
 var asm = Assembly.LoadFrom(Path.GetFullPath(dll));
 var t = asm.GetType("Emby.Server.StrmDirect.StrmDirect", throwOnError: true)!;
-var isMatch = t.GetMethod("IsMatch", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public)!;
-var fPrefixes = t.GetField("_prefixes", BindingFlags.Static | BindingFlags.NonPublic)!;
-var fNext = t.GetField("_nextReload", BindingFlags.Static | BindingFlags.NonPublic)!;
+const BindingFlags Any = BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public;
+var isMatch = t.GetMethod("IsMatch", Any)!;
+var isRedirect = t.GetMethod("IsRedirect", Any)!;
+var isParallel = t.GetMethod("IsParallel", Any)!;
+var getSetting = t.GetMethod("GetSetting", Any)!;
+var getSettingSource = t.GetMethod("GetSettingSource", Any)!;
+var getErrors = t.GetMethod("GetErrors", Any)!;
+var getRoutes = t.GetMethod("GetRoutes", Any)!;
+var getSettings = t.GetMethod("GetSettings", Any)!;
+var invalidate = t.GetMethod("InvalidateCache", Any)!;
 
-bool M(string? s) {
-    try { return (bool)isMatch.Invoke(null, new object?[] { s })!; }
+bool Ask(MethodInfo m, string? s) {
+    try { return (bool)m.Invoke(null, new object?[] { s })!; }
     catch (TargetInvocationException e) { Console.WriteLine("    !! threw: " + e.InnerException); return false; }
 }
-void Reset() { fPrefixes.SetValue(null, null); fNext.SetValue(null, 0L); }   // bust the 30s cache
+bool M(string? s) => Ask(isMatch, s);
+string? Setting(MethodInfo m, string key) {
+    try { return (string?)m.Invoke(null, new object?[] { key }); }
+    catch (TargetInvocationException e) { Console.WriteLine("    !! threw: " + e.InnerException); return null; }
+}
+void Reset() { invalidate.Invoke(null, null); }   // bust the 30s cache
 
 int pass = 0, fail = 0;
 void Check(string name, bool got, bool want) {
@@ -55,7 +67,7 @@ Check("any path under the prefix matches", M("https://pan.example.com/other"), t
 
 Console.WriteLine("\n3) config file via EMBY_STRM_CONFIG (comments, blank lines, whitespace)");
 Environment.SetEnvironmentVariable("EMBY_STRM_PREFIXES", null);
-var f = Path.Combine(Path.GetTempPath(), "strm-direct-test.txt");
+var f = Path.Combine(Path.GetTempPath(), "strm-routing-test.txt");
 File.WriteAllText(f, "# prefixes\n\n  https://pan.example.com/  \n\n# another comment\nhttps://two.example/d/\n");
 Environment.SetEnvironmentVariable("EMBY_STRM_CONFIG", f);
 Reset();
@@ -80,6 +92,35 @@ Environment.SetEnvironmentVariable("EMBY_STRM_CONFIG", f);
 Reset();
 Check("garbage content -> no throw", M("https://pan.example.com/d/a.mkv"), false);
 File.Delete(f);
+
+// 6) The shared vector table, run against the CLONED copy of the parser. The same table runs
+//    against the helper's copy in EmbyStrmParallel.Tests, which is what stops check-config and
+//    the runtime from ever drifting apart (references/mode-routing.md 4.1).
+Console.WriteLine("\n6) shared parse vectors (identical table runs against the helper build)");
+var vectorFile = Path.Combine(Path.GetTempPath(), "strm-routing-vectors-" + Guid.NewGuid().ToString("N") + ".txt");
+File.WriteAllText(vectorFile, RoutingVectors.Text());
+try
+{
+    RoutingVectors.ResetEnvironment(vectorFile);
+    Reset();
+    int n = RoutingVectors.Run(
+        s => Ask(isMatch, s),
+        s => Ask(isRedirect, s),
+        s => Ask(isParallel, s),
+        k => Setting(getSetting, k),
+        k => Setting(getSettingSource, k),
+        () => (string[])getErrors.Invoke(null, null)!,
+        () => (string[])getRoutes.Invoke(null, null)!,
+        () => (string[])getSettings.Invoke(null, null)!,
+        (name, ok) => Check(name, ok, true));
+    Console.WriteLine($"   ({n} vector checks)");
+}
+finally
+{
+    File.Delete(vectorFile);
+    foreach (var v in RoutingVectors.EnvVars()) Environment.SetEnvironmentVariable(v, null);
+    Reset();
+}
 
 Console.WriteLine($"\n{(fail == 0 ? "ALL PASS" : "FAILURES")}   pass={pass} fail={fail}");
 return fail == 0 ? 0 : 1;

@@ -1,0 +1,58 @@
+# Routing table for .strm / remote-URL sources.
+#
+#   <url-prefix>  [302|parallel]        one prefix per line, mode optional
+#   <key> = <value>                     global tuning settings
+#   # ...                               comment, to end of line
+#
+# Matching is StartsWith, case-insensitive, against MediaSourceInfo.Path.
+# Omitting the mode means 302. The mode decides which patch handles the source:
+#
+#   302        the server answers a redirect and steps out of the transfer path.
+#              Right when the origin does NOT throttle a single connection.
+#   parallel   the server fetches the file over several concurrent Range requests
+#              and relays it. Right when the origin throttles PER CONNECTION —
+#              a 302 would just move that bottleneck to the player.
+#              Run parallel/probe-origin.sh first; do not guess.
+#
+# Both modes disable transcoding for the matched source: once ffmpeg re-encodes,
+# the point of either mode is gone.
+#
+# A misspelled mode voids the whole line and is reported by `embypatch check` —
+# it is never quietly downgraded to 302, because "parallel is on but somehow
+# still stuttering" is a miserable thing to debug.
+#
+# Changes take effect within 30 seconds — no server restart needed.
+# An empty file means every patch is inert and the server behaves exactly like stock Emby.
+#
+# Install to <programdata>/config/strm-routing.txt
+# Or override with EMBY_STRM_PREFIXES="https://a/ parallel;https://b/ 302"
+# Or point at any path with EMBY_STRM_CONFIG=/path/to/strm-routing.txt
+#
+# Keep prefixes narrow. Anything else Emby serves over http (Live TV channels, for example)
+# must not match, or it will lose its transcoding fallback.
+
+https://pan.example.com/                parallel
+https://fast-cdn.example.net/media/     302
+https://other.example/                             # no token = 302
+
+# ---------------------------------------------------------------------------
+# Global settings. Priority is environment variable > this file > built-in default.
+# Keys are case-insensitive and '_' is the same as '-'.
+# They live here rather than in bin/emby-server because an Emby upgrade rewrites
+# that file and leaves programdata/ alone — tuning that vanishes on upgrade shows
+# up months later as "it started stuttering again" and nobody suspects the knobs.
+#
+#   ramp-seconds          6      EMBY_STRM_RAMP_SECONDS          seconds between added connections
+#   connections           8      EMBY_STRM_CONNECTIONS           concurrent Range requests
+#   chunk-mb              8      EMBY_STRM_CHUNK_MB              bytes per Range request
+#   buffer-mb           128      EMBY_STRM_BUFFER_MB             reorder buffer ceiling
+#   initial-connections   2      EMBY_STRM_INITIAL_CONNECTIONS   connections opened immediately
+#   log                 off      EMBY_STRM_LOG                   diagnostics file path
+#
+# ramp-seconds is the one worth tuning per origin, and it has a cliff at 1.
+# Sweep it against your own origin with `parallel/run-tests.sh seeks 25` before changing it
+# (the header of that script has the method and a measured table), and only after
+# parallel/probe-origin.sh says your origin throttles per connection.
+
+# ramp-seconds = 2
+# log = /var/packages/EmbyServer/target/programdata/logs/strm-parallel.log

@@ -6,4 +6,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>rtcheck</AssemblyName>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The shared parse vectors, also compiled into EmbyStrmParallel.Tests. -->
+    <Compile Include="../shared/RoutingVectors.cs" Link="RoutingVectors.cs" />
+  </ItemGroup>
 </Project>

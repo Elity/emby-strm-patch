@@ -8,4 +8,10 @@
     <Optimize>false</Optimize>
     <DebugType>none</DebugType>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- One parser, two products. The helper assembly compiles this very same file; see the
+         header of shared/RoutingConfig.cs and references/mode-routing.md 4.1. -->
+    <Compile Include="../shared/RoutingConfig.cs" Link="RoutingConfig.cs" />
+  </ItemGroup>
 </Project>

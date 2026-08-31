@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>EmbyStrmParallel.Tests</AssemblyName>
+    <RootNamespace>EmbyStrmParallel.Tests</RootNamespace>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/EmbyStrmParallel.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The shared parse vectors, also compiled into rtcheck. -->
+    <Compile Include="../../../shared/RoutingVectors.cs" Link="RoutingVectors.cs" />
+  </ItemGroup>
+
+</Project>

@@ -7,6 +7,9 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Every platform runs the suites whose assertions are about behaviour rather than about
+  # elapsed time. Config path resolution is filesystem-dependent, which is the reason three
+  # platforms are worth the minutes.
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -22,10 +25,45 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      # Patches two synthetic assemblies shaped like Emby's, then invokes the patched
-      # methods and checks the results. No Emby binaries are needed or used.
-      # Running on three platforms exercises the config path resolution, which is
-      # filesystem-dependent.
-      - name: Run tests
+      # Patches two synthetic assemblies shaped like Emby's, then invokes the patched methods
+      # and checks the results. Also covers the `check` subcommand. No Emby binaries needed.
+      - name: Patcher, injections and check-config
         shell: bash
         run: bash tests/run.sh
+
+      # The mock subset: routing-config parsing, settings wiring, and the self-arming
+      # diagnostics — the last of which drives the mock origin server end to end. Everything
+      # here asserts on content, so a loaded runner cannot make it flap.
+      - name: Fetcher config and diagnostics (mock subset)
+        shell: bash
+        run: bash parallel/run-tests.sh config
+
+  # The remaining fetcher tests assert on WALL-CLOCK behaviour, and two of them are slow on
+  # purpose: a trickling connection has to be given ~20 s to be abandoned and retried, and a
+  # genuinely slow consumer has to survive 11.7 s without tripping the throughput floor. Those
+  # are exactly the assertions that go red on a busy shared runner for reasons unrelated to the
+  # code, so they run on one platform only. The fetcher itself is plain BCL code with no
+  # platform-specific paths, so a single platform is honest coverage rather than a compromise.
+  timing:
+    name: timing-sensitive (ubuntu-latest)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      # Correctness, fault injection, backpressure, memory ceilings, cancellation.
+      # Loopback only — no network egress.
+      - name: Fetcher correctness, faults and memory (full mock suite)
+        shell: bash
+        run: bash parallel/run-tests.sh mock
+
+      # Drives probe-origin.sh against tests/origin-sim.py, which can impose either a
+      # per-connection cap or a shared one, and asserts each shape yields the right verdict —
+      # including the shapes that must yield NO verdict.
+      - name: probe-origin verdicts
+        shell: bash
+        run: bash parallel/tests/probe-origin.test.sh
