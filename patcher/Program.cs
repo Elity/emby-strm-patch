@@ -38,7 +38,7 @@ using Mono.Cecil.Cil;
 // returns from GetStaticFileResult, no FileWriter is constructed, and GetContent is never
 // reached. See references/mode-routing.md §2.
 //
-// Three patches ask the routing table three different questions (spec §4):
+// Three patches ask the routing table three different questions (mode-routing.md §4):
 //   A -> IsMatch      any configured prefix, whatever its mode (transcoding defeats both modes)
 //   B -> IsRedirect   prefix whose mode is 302
 //   C -> ParallelFetch.IsMatch in the helper assembly, which forwards to IsParallel
@@ -171,7 +171,7 @@ internal static class Program
 
             var cloned = TypeCloner.Clone(srcType, module, HelperNs, HelperName);
 
-            // A patches on "any mode", B only on "mode is 302" (spec §4). Resolve both up front
+            // A patches on "any mode", B only on "mode is 302" (mode-routing.md §4). Resolve both up front
             // and name the missing one: a null slipping through would surface as a
             // NullReferenceException deep inside Cecil, miles from the actual cause.
             isMatch    = Matcher(cloned, "IsMatch");
@@ -300,7 +300,7 @@ internal static class Program
     // ---------- Patch A: never offer transcoding for matched sources ----------
     // `isMatch` is StrmDirect.IsMatch — deliberately mode-blind. Both 302 and parallel are
     // pointless once ffmpeg re-encodes the source, so A covers every configured prefix and has
-    // no per-prefix switch (spec §4).
+    // no per-prefix switch (mode-routing.md §4).
     private static bool PatchNoTranscode(ModuleDefinition module, MethodDefinition isMatch)
     {
         Console.WriteLine("patch    : A - force direct play for matched sources");

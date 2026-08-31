@@ -22,7 +22,7 @@ using Mono.Cecil;
 //
 // It never repairs anything. A prefix asking for a mode whose patch is missing is reported and
 // the exit code goes to 1; it is not quietly downgraded. Silent behaviour changes are the exact
-// failure mode this whole project is built to avoid (spec §5, §11).
+// failure mode this whole project is built to avoid (mode-routing.md §5, §11).
 internal static class CheckConfig
 {
     // Names of the DLLs and the deps entry, all relative to <emby-system-dir>.
@@ -139,7 +139,7 @@ internal static class CheckConfig
             {
                 Console.WriteLine($"     {kv.Key}={kv.Value}");
                 warns.Add($"{kv.Key} is exported from bin/emby-server; an Emby upgrade rewrites that file " +
-                          "and the setting vanishes silently. Move it into strm-routing.txt (spec §3.3).");
+                          "and the setting vanishes silently. Move it into strm-routing.txt (mode-routing.md §3.3).");
             }
         }
 
@@ -329,7 +329,7 @@ internal static class CheckConfig
 
     // ---------------- configuration ----------------
 
-    /// The five-layer lookup from spec §3.1, with the two directories supplied explicitly.
+    /// The five-layer lookup from mode-routing.md §3.1, with the two directories supplied explicitly.
     ///
     /// StrmDirect.FindFile cannot be reused verbatim: layer 3 reads `-programdata` off the
     /// server's command line and layers 4-5 hang off AppContext.BaseDirectory, and in this
@@ -442,7 +442,7 @@ internal static class CheckConfig
     ///
     /// shared/RoutingConfig.cs keeps them in private fields because nothing on Emby's hot path
     /// enumerates them — only this report does. Reaching for them reflectively is the lesser
-    /// evil: re-tokenising the file here would create the second parser that spec §4.1 exists to
+    /// evil: re-tokenising the file here would create the second parser that mode-routing.md §4.1 exists to
     /// prevent. Picks up a GetRoutes()/GetSettings() accessor automatically if either is added.
     private static string[] Pairs(string accessor, string field)
     {
