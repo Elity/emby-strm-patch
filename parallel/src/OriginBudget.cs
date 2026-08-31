@@ -24,6 +24,15 @@ namespace EmbyStrmParallel
     /// the next one, 25.14 -> 0.15 Mbps, recovering only after ~90 s idle). A permit is a right
     /// to have one request in flight; it carries no state and cannot be poisoned.
     ///
+    /// **A permit covers ONE request, not one worker and not one stream.** That distinction is
+    /// the whole difference between a budget and an admission policy. The first version of this
+    /// class handed a permit to each worker for the worker's whole life, which made
+    /// `max-origin-connections / connections` the maximum number of streams that could play at
+    /// once: at 12 / 6 the third viewer's workers queued behind two streams that would not let
+    /// go for two hours, and playback froze silently. Request-scoped permits are returned every
+    /// few seconds, so an oversubscribed origin makes every stream slower - which is what
+    /// throttling is supposed to feel like - instead of starving some of them completely.
+    ///
     /// Grouping is per authority rather than per configured prefix, so two prefixes on the same
     /// host correctly contend, and two different hosts correctly do not — one origin being slow
     /// must not throttle an unrelated one.
@@ -36,6 +45,13 @@ namespace EmbyStrmParallel
             internal int Limit;
             internal int InUse;
             internal int Peak;
+            /// <summary>
+            /// Callers parked on Gate, or about to be. Counted inside the entry's lock BEFORE the
+            /// wait starts, because InUse alone cannot make the gate swap safe: InUse is raised
+            /// only after WaitAsync returns, so there is a window where a caller already owns a
+            /// permit from the old gate while the entry still looks completely idle.
+            /// </summary>
+            internal int Waiting;
         }
 
         private static readonly ConcurrentDictionary<string, Entry> Origins =
@@ -94,16 +110,35 @@ namespace EmbyStrmParallel
         }
 
         /// <summary>
-        /// Waits for a permit for this origin. Cancellation is the caller's stream token, so a
-        /// stream that is disposed while queued wakes immediately instead of holding a task.
+        /// Waits up to <paramref name="timeout"/> for a permit for this origin, or returns null.
+        /// Cancellation is the caller's stream token, so a stream that is disposed while queued
+        /// wakes immediately instead of holding a task.
         ///
-        /// A `limit` different from the one this origin was created with replaces the gate. That
-        /// is what keeps `max-origin-connections` live-reloadable like every other setting;
-        /// permits already held are returned to the old gate, so during the moment of a manual
-        /// config change the two can briefly coexist. Bounded, rare, and far better than
-        /// requiring a restart for this one knob.
+        /// **There is no unbounded overload, deliberately.** Every waiter here is either a host
+        /// request thread (which must never block forever) or a chunk attempt whose reader is
+        /// waiting in order behind it. An unbounded wait turns "the budget is busy" into a
+        /// playback freeze with no error and no log, which is strictly worse than any error this
+        /// component can report. The timeout is a watchdog against a permit that is never given
+        /// back, not a contention limit: a chunk attempt holds its permit for seconds, so
+        /// ordinary queuing resolves long before it. The one legitimate long holder is the
+        /// degraded single-connection path (SkipLimitStream), which keeps one permit for the
+        /// life of that stream - so on an origin serving several of those, reaching the timeout
+        /// means "the budget is genuinely full", not "something leaked".
+        ///
+        /// A `limit` different from the one this origin was created with replaces the gate, but
+        /// only while nothing is in flight and nobody is queued. Restricting it to that moment is
+        /// what stops the swap from stranding whoever is already waiting on the old gate, and a
+        /// stranded waiter is the invisible freeze this class exists to prevent.
+        ///
+        /// The cost is that the change is DEFERRED, not dropped, and two things can defer it for
+        /// a while: a continuously busy origin, and the degraded single-connection path
+        /// (SkipLimitStream), which holds one permit for a whole stream rather than for one
+        /// attempt. So a `max-origin-connections` edit lands "at the next quiet moment for this
+        /// origin", not "within a chunk". `embypatch check` still reports the configured value
+        /// and where it came from, so nothing about it is silent.
         /// </summary>
-        internal static async Task<Permit> AcquireAsync(string key, int limit, CancellationToken ct)
+        internal static async Task<Permit> TryAcquireAsync(string key, int limit, TimeSpan timeout,
+                                                           CancellationToken ct)
         {
             if (limit < 1) limit = 1;
 
@@ -112,17 +147,38 @@ namespace EmbyStrmParallel
             SemaphoreSlim gate;
             lock (e)
             {
-                if (e.Limit != limit)
+                if (e.Limit != limit && Volatile.Read(ref e.InUse) == 0 && e.Waiting == 0)
                 {
                     e.Gate = new SemaphoreSlim(limit, limit);
                     e.Limit = limit;
                 }
                 gate = e.Gate;
+                e.Waiting++;
             }
 
-            await gate.WaitAsync(ct).ConfigureAwait(false);
+            bool got;
+            try
+            {
+                got = await gate.WaitAsync(timeout, ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                lock (e) { e.Waiting--; }
+                throw;
+            }
 
+            if (!got)
+            {
+                lock (e) { e.Waiting--; }
+                return null;
+            }
+
+            // Raise InUse before dropping Waiting, so the pair is never both zero while this
+            // permit exists - which is exactly the instant a concurrent limit change would
+            // otherwise decide the origin was idle and swap the gate out from under it.
             int now = Interlocked.Increment(ref e.InUse);
+            lock (e) { e.Waiting--; }
+
             int peak = Volatile.Read(ref e.Peak);
             while (now > peak)
             {
@@ -147,10 +203,12 @@ namespace EmbyStrmParallel
             return Origins.TryGetValue(key, out e) ? Volatile.Read(ref e.Peak) : 0;
         }
 
-        internal static void ResetPeak(string key)
+        /// <summary>The limit currently in force for this origin, or 0 if it has never been used.</summary>
+        internal static int Limit(string key)
         {
             Entry e;
-            if (Origins.TryGetValue(key, out e)) Volatile.Write(ref e.Peak, Volatile.Read(ref e.InUse));
+            if (!Origins.TryGetValue(key, out e)) return 0;
+            lock (e) { return e.Limit; }
         }
 
         /// <summary>Test hook: forget every origin. Never called from the fetch path.</summary>

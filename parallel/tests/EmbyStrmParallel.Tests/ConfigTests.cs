@@ -292,6 +292,7 @@ namespace EmbyStrmParallel.Tests
                         "chunk-mb = 4\n" +
                         "buffer-mb = 64\n" +
                         "initial-connections = 3\n" +
+                        "max-origin-connections = 9\n" +
                         "ramp-seconds = 2\n");
 
                     ParallelFetchOptions o = ParallelFetchOptions.FromConfiguration();
@@ -299,9 +300,14 @@ namespace EmbyStrmParallel.Tests
                     Harness.AssertEqual(4L * 1024 * 1024, o.ChunkSize, "chunk-mb");
                     Harness.AssertEqual(64L * 1024 * 1024, o.MaxBufferBytes, "buffer-mb");
                     Harness.AssertEqual(3, o.InitialConnections, "initial-connections");
+                    // The only test of this key's READ path. Every budget test sets the property
+                    // in code, and `embypatch check` reads the setting through StrmDirect, so one
+                    // wrong letter in the string here would ship a knob that displays the
+                    // configured value while the fetcher silently runs on the default of 12.
+                    Harness.AssertEqual(9, o.MaxOriginConnections, "max-origin-connections");
                     Harness.AssertEqual(2, (long)o.ConnectionRampInterval.TotalSeconds, "ramp-seconds");
                     await Task.CompletedTask;
-                    return "5 knobs read from the file, no env involved";
+                    return "6 knobs read from the file, no env involved";
                 }
                 finally { ClearEnv(); try { Directory.Delete(dir, true); } catch { } }
             }).ConfigureAwait(false);
@@ -320,6 +326,47 @@ namespace EmbyStrmParallel.Tests
                     Harness.AssertEqual(8L * 1024 * 1024, o.ChunkSize, "chunk-mb should still be the default");
                     await Task.CompletedTask;
                     return "file wins where set, default elsewhere";
+                }
+                finally { ClearEnv(); try { Directory.Delete(dir, true); } catch { } }
+            }).ConfigureAwait(false);
+
+            await Harness.RunAsync("every settable key is covered by the test-isolation list", async () =>
+            {
+                // A new key has to be added in four places (the option reader, StrmDirect's
+                // key -> env table, CheckConfig's copy of it, and RoutingVectors.EnvVars). Only
+                // the last one breaks nothing when forgotten - until a machine happens to export
+                // the variable, and then every test that "starts from a clean slate" starts
+                // dirty. `max-origin-connections` was forgotten there exactly once already.
+                //
+                // The parser's own rejection message is the closed set, so this derives the list
+                // from the product rather than restating it, and the naming rule is mechanical.
+                ClearEnv();
+                string dir = Path.Combine(Path.GetTempPath(), "strmkeys-" + Guid.NewGuid().ToString("N"));
+                try
+                {
+                    WriteConfig(dir, "definitely-not-a-setting = 1\n");
+                    string[] errors = StrmDirect.GetErrors();
+                    Harness.Assert(errors.Length == 2, "expected exactly one rejected line, got " + errors.Length / 2);
+
+                    const string Marker = "expected one of ";
+                    int at = errors[1].IndexOf(Marker, StringComparison.Ordinal);
+                    Harness.Assert(at >= 0, "the parser no longer lists its known keys: " + errors[1]);
+
+                    string[] isolation = RoutingVectors.EnvVars();
+                    string[] keys = errors[1].Substring(at + Marker.Length).Split(',');
+                    int seen = 0;
+                    foreach (string raw in keys)
+                    {
+                        string key = raw.Trim();
+                        if (key.Length == 0) continue;
+                        string env = "EMBY_STRM_" + key.ToUpperInvariant().Replace('-', '_');
+                        Harness.Assert(Array.IndexOf(isolation, env) >= 0,
+                            "RoutingVectors.EnvVars() is missing " + env + " for setting '" + key + "'");
+                        seen++;
+                    }
+                    Harness.Assert(seen >= 7, "only " + seen + " keys parsed out of: " + errors[1]);
+                    await Task.CompletedTask;
+                    return seen + " settable keys, every one clearable";
                 }
                 finally { ClearEnv(); try { Directory.Delete(dir, true); } catch { } }
             }).ConfigureAwait(false);

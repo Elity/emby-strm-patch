@@ -17,6 +17,8 @@ namespace EmbyStrmParallel
         private readonly HttpResponseMessage _response;
         private readonly Stream _inner;
         private readonly HttpClient _client;
+        /// <summary>The origin permit for the one connection this stream lives on, released at close.</summary>
+        private readonly OriginBudget.Permit _permit;
         private readonly TimeSpan _readIdleTimeout;
         private readonly long _skipTotal;
         private readonly long _limit;
@@ -27,11 +29,12 @@ namespace EmbyStrmParallel
         private int _disposed;
 
         internal SkipLimitStream(HttpResponseMessage response, Stream inner, HttpClient client,
-                                 long skip, long limit, TimeSpan readIdleTimeout)
+                                 OriginBudget.Permit permit, long skip, long limit, TimeSpan readIdleTimeout)
         {
             _response = response;
             _inner = inner;
             _client = client;
+            _permit = permit;
             _readIdleTimeout = readIdleTimeout;
             _skipTotal = skip;
             _limit = limit;
@@ -129,6 +132,9 @@ namespace EmbyStrmParallel
                 try { _inner.Dispose(); } catch { }
                 try { _response.Dispose(); } catch { }
                 if (_client != null) { try { _client.Dispose(); } catch { } }
+                // After the socket is actually gone, so the origin never sees the replacement
+                // request before it has closed this one.
+                if (_permit != null) _permit.Dispose();
             }
             base.Dispose(disposing);
         }

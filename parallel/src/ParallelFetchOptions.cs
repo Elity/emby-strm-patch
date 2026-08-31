@@ -30,11 +30,17 @@ namespace EmbyStrmParallel
     /// (shared/RoutingConfig.cs). Keys in strm-routing.txt, with the environment variable that
     /// overrides each one:
     ///
-    ///   connections           EMBY_STRM_CONNECTIONS
-    ///   chunk-mb              EMBY_STRM_CHUNK_MB
-    ///   buffer-mb             EMBY_STRM_BUFFER_MB
-    ///   initial-connections   EMBY_STRM_INITIAL_CONNECTIONS
-    ///   ramp-seconds          EMBY_STRM_RAMP_SECONDS
+    ///   connections             EMBY_STRM_CONNECTIONS
+    ///   max-origin-connections  EMBY_STRM_MAX_ORIGIN_CONNECTIONS
+    ///   chunk-mb                EMBY_STRM_CHUNK_MB
+    ///   buffer-mb               EMBY_STRM_BUFFER_MB
+    ///   initial-connections     EMBY_STRM_INITIAL_CONNECTIONS
+    ///   ramp-seconds            EMBY_STRM_RAMP_SECONDS
+    ///
+    /// That list is a closed set repeated in four places (here, FromConfiguration below,
+    /// StrmDirect.EnvNameFor, CheckConfig.EnvNameOf) plus the docs; ConfigTests has a test that
+    /// derives it from the parser's own rejection message and checks the isolation list against
+    /// it, but the prose copies - including this one - are still checked by hand.
     ///
     /// Prefer the file. An Emby upgrade rewrites bin/emby-server, which is where the exported
     /// environment variables live, so tuning kept there vanishes on upgrade - and the symptom
@@ -64,8 +70,10 @@ namespace EmbyStrmParallel
         ///
         /// So 6 is not "the fastest setting"; it is the largest one that still leaves room for
         /// the second stream a seek creates. That reasoning only holds for TWO overlapping
-        /// streams — three viewers, or a burst of seeks, can still cross the cliff. The real fix
-        /// is a process-wide budget rather than a per-stream number; see references/mode-routing.md 11.1.
+        /// streams — three viewers, or a burst of seeks, would still cross the cliff, which is
+        /// why MaxOriginConnections below exists: the budget, not this number, is what actually
+        /// bounds what the origin sees. 6 remains the per-stream default because it is the value
+        /// measured to be healthy for one stream running flat out. See mode-routing.md 11.1.
         /// </summary>
         public int Connections { get; set; } = 6;
 
@@ -190,6 +198,22 @@ namespace EmbyStrmParallel
         /// </summary>
         public int MaxOriginConnections { get; set; } = 12;
 
+        /// <summary>
+        /// Watchdog on a single wait for an origin permit. Not a tuning knob and deliberately not
+        /// configurable: it exists only so that no wait for the budget can be infinite.
+        ///
+        /// A chunk attempt holds its permit for seconds (~16 s at the measured per-connection
+        /// rate) and SemaphoreSlim serves waiters FIFO, so ordinary contention - even a badly
+        /// oversubscribed origin - drains long before this. Two things can legitimately hold a
+        /// permit much longer: a reader that has stopped (a paused player parks its workers on
+        /// the reorder ring with their connections still open), and the degraded
+        /// single-connection path, which keeps one permit for a whole stream. Reaching the
+        /// timeout therefore means "this origin has no capacity to give", and a chunk that fails
+        /// loudly beats a stream that hangs silently: the freeze this replaced had no error, no
+        /// fallback and no log line, which made it invisible in production.
+        /// </summary>
+        internal TimeSpan OriginPermitTimeout { get; set; } = TimeSpan.FromSeconds(120);
+
         /// <summary>True when Normalize() had to lower Connections to fit the budget.</summary>
         internal bool ConnectionsClampedByBudget { get; private set; }
 
@@ -249,7 +273,21 @@ namespace EmbyStrmParallel
             // 68 x 256 MiB = 17 GiB of read-ahead in a process that also has to serve video.
             if (o.MaxBufferBytes > MaxBufferMiB * 1024 * 1024) o.MaxBufferBytes = MaxBufferMiB * 1024 * 1024;
 
-            // Slots = the reorder window. Memory ceiling == Slots * ChunkSize.
+            // Blocks a single chunk's reorder channel must be able to hold.
+            //
+            // The clean-run count is not enough. A retry resumes at cursor.Pos, and an attempt
+            // abandoned by the throughput floor publishes a SHORT block before it throws, so a
+            // resumed chunk crosses one extra block boundary per retry it took. Sized to the
+            // clean-run count, the worker parked on writer.WriteAsync for that last block - and
+            // a parked worker holds an origin permit it cannot give back until the consumer
+            // drains the slot, which a paused player never does. Production logs ~50
+            // slow-connection retries in a single session, so this is a routine path, not an
+            // exotic one. The headroom costs MaxAttempts * BlockSize per slot: ~3% at the
+            // shipped 8 MiB chunk.
+            o.BlocksPerChunk = (o.ChunkSize + o.BlockSize - 1) / o.BlockSize + o.MaxAttempts;
+            if (o.BlocksPerChunk < 1) o.BlocksPerChunk = 1;
+
+            // Slots = the reorder window. Memory ceiling == Slots * BlocksPerChunk * BlockSize.
             long slots = o.MaxBufferBytes / o.ChunkSize;
             if (slots > o.Connections + 4) slots = o.Connections + 4;
             if (slots < 1) slots = 1;
@@ -267,22 +305,26 @@ namespace EmbyStrmParallel
             if (o.ConnectionRampInterval > TimeSpan.FromSeconds(MaxRampSeconds))
                 o.ConnectionRampInterval = TimeSpan.FromSeconds(MaxRampSeconds);
 
-            o.BlocksPerChunk = (o.ChunkSize + o.BlockSize - 1) / o.BlockSize;
-            if (o.BlocksPerChunk < 1) o.BlocksPerChunk = 1;
-
             if (o.ResponseHeadersTimeout <= TimeSpan.Zero) o.ResponseHeadersTimeout = TimeSpan.FromSeconds(20);
             if (o.ReadIdleTimeout <= TimeSpan.Zero) o.ReadIdleTimeout = TimeSpan.FromSeconds(20);
             if (o.StallBudget <= TimeSpan.Zero) o.StallBudget = TimeSpan.FromSeconds(30);
             if (o.MinThroughputBytesPerSec < 0) o.MinThroughputBytesPerSec = 0;
             if (o.MinThroughputGrace <= TimeSpan.Zero) o.MinThroughputGrace = TimeSpan.FromSeconds(6);
+            if (o.OriginPermitTimeout <= TimeSpan.Zero) o.OriginPermitTimeout = TimeSpan.FromSeconds(120);
             if (o.MaxIgnoredRangeSkipBytes < 0) o.MaxIgnoredRangeSkipBytes = 0;
 
             return o;
         }
 
+        /// <summary>
+        /// The honest bound on bytes this stream can hold: every slot's channel, full. Not
+        /// Slots * ChunkSize - that ignores the retry headroom in BlocksPerChunk and would
+        /// under-report by a few percent, which is exactly the kind of "ceiling" that is only
+        /// ever noticed when it turns out not to be one.
+        /// </summary>
         internal long MemoryCeilingBytes
         {
-            get { return (long)Slots * ChunkSize; }
+            get { return (long)Slots * BlocksPerChunk * BlockSize; }
         }
 
         private static int Clamp(int v, int lo, int hi)
@@ -297,7 +339,7 @@ namespace EmbyStrmParallel
         /// There is deliberately NO environment-variable reading here: StrmDirect.GetSetting
         /// already resolves env &gt; file &gt; nothing for every key in one place. A second reader
         /// alongside it is exactly the two-implementations-drift problem the shared parser
-        /// exists to kill (references/mode-routing.md 4.1).
+        /// exists to kill (mode-routing.md 4.1).
         ///
         /// Called once per stream rather than cached, which is what makes an edit to
         /// strm-routing.txt go live inside the parser's 30 s window instead of at the next

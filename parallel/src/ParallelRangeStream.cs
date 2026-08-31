@@ -14,9 +14,12 @@ namespace EmbyStrmParallel
     /// Range requests but handed to the consumer strictly in order.
     ///
     /// Shape: a ring of `Slots` reorder slots. Chunk i always lands in slot (i % Slots) and each
-    /// slot is a bounded channel sized to hold one whole chunk. Memory ceiling is therefore
-    /// Slots * ChunkSize regardless of file size. A worker cannot start chunk i until the reader
-    /// has finished chunk i-Slots, which is the backpressure.
+    /// slot is a bounded channel sized to hold one whole chunk plus retry headroom. Memory
+    /// ceiling is therefore Slots * BlocksPerChunk * BlockSize regardless of file size. A worker
+    /// cannot start chunk i until the reader has finished chunk i-Slots, which is the
+    /// backpressure - and because that wait happens BEFORE the chunk's permit is taken, a
+    /// consumer that stops reading costs the origin's budget nothing once the chunks already in
+    /// flight have landed.
     ///
     /// Chunks are claimed under a single assignment lock, and the slot is acquired *inside* that
     /// lock. Claiming the index and the slot non-atomically would let a worker holding index i+S
@@ -44,9 +47,6 @@ namespace EmbyStrmParallel
         private readonly StreamStats _stats = new StreamStats();
         private HttpClient _client;   // owned: this stream's private connection pool
 
-        private readonly string _originKey;
-        private long _permitWaitMs;      // summed across workers, for the closing log line
-
         private readonly long _rangeStart;
         private readonly long _totalToRead;
         private readonly long _chunkCount;
@@ -57,7 +57,7 @@ namespace EmbyStrmParallel
         private int _faulted;                 // 0/1, stops further chunk claims
         private Exception _fatal;             // worker died outside a chunk; nothing poisoned a channel
 
-        private HttpResponseMessage _preOpened;
+        private PreOpenedChunk _preOpened;
 
         // reader-side state (single consumer)
         private long _readerChunk;
@@ -73,7 +73,7 @@ namespace EmbyStrmParallel
 
         internal ParallelRangeStream(HttpClient client, string url, long rangeStart, long totalToRead,
                                      long resourceTotal, ParallelFetchOptions options,
-                                     HttpResponseMessage preOpenedFirstChunk,
+                                     PreOpenedChunk preOpenedFirstChunk,
                                      CancellationToken cancellationToken)
         {
             _o = options;
@@ -86,7 +86,6 @@ namespace EmbyStrmParallel
             StreamId = Interlocked.Increment(ref _nextStreamId);
             _tag = "#" + StreamId;
 
-            _originKey = OriginBudget.KeyFor(url);
             _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             _downloader = new ChunkDownloader(client, url, options, _tag, _stats, resourceTotal);
 
@@ -111,7 +110,7 @@ namespace EmbyStrmParallel
         internal long TotalToRead { get { return _totalToRead; } }
         internal long ChunkCount { get { return _chunkCount; } }
         internal int SlotCount { get { return _slots.Length; } }
-        internal long MemoryCeilingBytes { get { return (long)_slots.Length * _o.ChunkSize; } }
+        internal long MemoryCeilingBytes { get { return (long)_slots.Length * _o.BlocksPerChunk * _o.BlockSize; } }
         /// <summary>Completes when every worker has exited. Used by tests to prove teardown is prompt.</summary>
         internal Task WorkersCompletion { get { return _workers; } }
 
@@ -119,17 +118,11 @@ namespace EmbyStrmParallel
 
         private async Task WorkerLoopAsync(int workerIndex)
         {
-            // One permit per worker, held for the worker's whole life.
-            //
-            // Per-request permits would be more precise, but the probe response is HANDED OVER
-            // to become chunk 0's pre-opened body, so a request-scoped permit would have to
-            // change owner across objects and be returned correctly on all of the success,
-            // failure, cancellation and degrade paths. Leaking one there freezes playback
-            // forever with no error - the single worst failure this component can have. A worker
-            // is already ~one concurrent connection and has one obvious exit, so the permit has
-            // exactly one release site. A worker parked on a full channel still holds its permit;
-            // that is conservative in the safe direction.
-            OriginBudget.Permit permit = null;
+            // No permit is taken here. Origin permits are per REQUEST and live in
+            // ChunkDownloader: a worker only exits once the whole stream is finished, so a
+            // worker-scoped permit made `max-origin-connections / connections` the number of
+            // streams allowed to play at once, and everything past that froze on the semaphore
+            // with no error, no log and no fallback.
             try
             {
                 // Connection slow-start: workers past InitialConnections join gradually, so a
@@ -140,13 +133,6 @@ namespace EmbyStrmParallel
                     await Task.Delay(TimeSpan.FromTicks(_o.ConnectionRampInterval.Ticks * steps), _cts.Token)
                               .ConfigureAwait(false);
                 }
-
-                // After the ramp, so a worker that will not run for another 6 seconds is not
-                // sitting on a permit some other stream could be using right now.
-                long waitStart = Environment.TickCount64;
-                permit = await OriginBudget.AcquireAsync(_originKey, _o.MaxOriginConnections, _cts.Token)
-                                           .ConfigureAwait(false);
-                Interlocked.Add(ref _permitWaitMs, Environment.TickCount64 - waitStart);
 
                 while (true)
                 {
@@ -187,8 +173,7 @@ namespace EmbyStrmParallel
                     _schedule.Range(index, out relStart, out relLength);
                     long start = _rangeStart + relStart;
                     long end = start + relLength - 1;
-                    HttpResponseMessage pre = index == 0 ? Interlocked.Exchange(ref _preOpened, null) : null;
-
+                    PreOpenedChunk pre = index == 0 ? Interlocked.Exchange(ref _preOpened, null) : null;
                     try
                     {
                         await _downloader.DownloadAsync(start, end, chan.Writer, pre, _cts.Token).ConfigureAwait(false);
@@ -221,12 +206,6 @@ namespace EmbyStrmParallel
                 Interlocked.CompareExchange(ref _fatal, ex, null);
                 FetchLog.Write(_tag + " worker aborted: " + FetchLog.Describe(ex));
                 try { _cts.Cancel(); } catch { }
-            }
-            finally
-            {
-                // The single release site. Every exit above - normal, cancelled, faulted -
-                // funnels through here, which is the whole reason the permit is worker-scoped.
-                if (permit != null) permit.Dispose();
             }
         }
 
@@ -474,7 +453,8 @@ namespace EmbyStrmParallel
 
                 ReleaseCurrentBlock();
 
-                HttpResponseMessage pre = Interlocked.Exchange(ref _preOpened, null);
+                // Disposes the probe body AND the origin permit accounting for it, together.
+                PreOpenedChunk pre = Interlocked.Exchange(ref _preOpened, null);
                 if (pre != null) { try { pre.Dispose(); } catch { } }
 
                 // Release the whole read-ahead window now, not at the next GC: complete every
@@ -523,7 +503,12 @@ namespace EmbyStrmParallel
                            " rate=" + mbps.ToString("0.00", CultureInfo.InvariantCulture) + "Mbps" +
                            " chunks=" + _stats.ChunksCompleted + "/" + _chunkCount +
                            " retries=" + _stats.Retries + " (slow=" + _stats.SlowRetries + ")" +
-                           " permitWait=" + (Volatile.Read(ref _permitWaitMs) / 1000.0).ToString("0.0", CultureInfo.InvariantCulture) + "s" +
+                           " permitWait=" + (_stats.PermitWaitMs / 1000.0).ToString("0.0", CultureInfo.InvariantCulture) + "s" +
+                           // Only when it is non-zero, and it is the loudest thing on the line
+                           // when it is: this stream is closing with workers still queued for the
+                           // origin's budget, which is the difference between "the origin was
+                           // slow" and "we throttled ourselves and never said so".
+                           (_stats.PermitWaiters > 0 ? " blockedOnBudget=" + _stats.PermitWaiters : "") +
                            (_fault != null ? " fault=" + _fault.GetType().Name : ""));
         }
 

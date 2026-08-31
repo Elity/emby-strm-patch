@@ -145,9 +145,62 @@ namespace EmbyStrmParallel
             // ParallelFetchOptions.MaxIgnoredRangeSkipBytes.
             bool refuseWholeBody = offset > o.MaxIgnoredRangeSkipBytes;
 
+            // Open() blocks a host request thread for everything below, so the whole of it -
+            // queuing for a permit AND every probe attempt - shares one deadline. Two independent
+            // budgets here would let the worst case be their sum.
+            //
+            // Blocking a host thread on an internal resource rather than only on network I/O is
+            // new, and under thread-pool starvation it can feed itself: the permit is released by
+            // a continuation that needs a pool thread. The deadline plus the host fallback is the
+            // whole recovery. Making TryOpen genuinely async is not a small change - the injected
+            // call site returns before any state machine starts - and is tracked in
+            // mode-routing.md 11.1 alongside the same limitation for the probe itself.
+            long openDeadline = Environment.TickCount64 + (long)o.StallBudget.TotalMilliseconds;
+
+            // The probe IS chunk 0, so it needs a permit like any other request. Taking it here
+            // rather than inside the stream is what keeps a queued stream from sitting on a live
+            // 206 body that the budget knows nothing about: at saturation that "few millisecond"
+            // window is the entire wait, and ten clients starting at once put ten uncounted
+            // connections on top of the budget - straight over the cliff it exists to avoid.
+            //
+            // Bounded, and failure is a clean degrade rather than an error: the throw becomes a
+            // null from TryOpen, and Emby serves the request on its own single connection. That
+            // path already exists, is correct, and is the right answer when the origin has no
+            // capacity left to give.
+            //
+            // The wait gets the shared deadline MINUS one full header timeout, so a permit won
+            // at the last moment is still a permit the probe has time to use. Spending all of it
+            // queuing would mean taking a slot and then immediately failing the request it was
+            // taken for - the worst of both outcomes.
+            string originKey = OriginBudget.KeyFor(url);
+            long permitBudgetMs = openDeadline - Environment.TickCount64 -
+                                  (long)o.ResponseHeadersTimeout.TotalMilliseconds;
+            if (permitBudgetMs < 1) permitBudgetMs = 1;
+            long permitWaitStart = Environment.TickCount64;
+            OriginBudget.Permit probePermit = OriginBudget.TryAcquireAsync(
+                    originKey, o.MaxOriginConnections, TimeSpan.FromMilliseconds(permitBudgetMs), cancellationToken)
+                .GetAwaiter().GetResult();
+            long probePermitWaitMs = Environment.TickCount64 - permitWaitStart;
+            if (probePermit == null)
+            {
+                throw new IOException("Origin " + originKey + " has no free connection budget (" +
+                                      o.MaxOriginConnections + " in use) after " +
+                                      (permitBudgetMs / 1000.0).ToString("0.0", CultureInfo.InvariantCulture) + "s.");
+            }
+
             bool probeWentOpenEnded;
-            HttpResponseMessage response = SendProbe(client, url, offset, probeEnd, o, refuseWholeBody,
-                                                     out probeWentOpenEnded, cancellationToken);
+            HttpResponseMessage response;
+            try
+            {
+                response = SendProbe(client, url, offset, probeEnd, o, refuseWholeBody,
+                                     openDeadline, out probeWentOpenEnded, cancellationToken);
+            }
+            catch
+            {
+                probePermit.Dispose();
+                throw;
+            }
+
             bool handedOff = false;
             try
             {
@@ -170,12 +223,22 @@ namespace EmbyStrmParallel
                     totalLength = full;
                     contentLength = eff0;
                     Stream body0 = response.Content.ReadAsStreamAsync(cancellationToken).GetAwaiter().GetResult();
+                    // The degraded path holds one origin connection for its whole life, so the
+                    // permit goes with it rather than being released here - one uncounted
+                    // connection per fallback stream is exactly the drift the budget prevents.
+                    //
+                    // Constructed BEFORE the hand-off flags are set. Setting them first and then
+                    // throwing between the two disarms every guard in the finally at once, and
+                    // leaks the response, the permit and the HttpClient together.
+                    SkipLimitStream degraded = new SkipLimitStream(response, body0, client, probePermit,
+                                                                   offset, eff0, o.ReadIdleTimeout);
                     handedOff = true;
                     clientHandedOff = true;
+                    probePermit = null;
                     FetchLog.Write("open path=single-conn-fallback (origin ignored Range) url=" + FetchLog.Tail(url) +
                                    " offset=" + offset + " length=" + eff0 + " total=" + full +
                                    " skip=" + FetchLog.Size(offset));
-                    return new SkipLimitStream(response, body0, client, offset, eff0, o.ReadIdleTimeout);
+                    return degraded;
                 }
 
                 if (response.StatusCode != HttpStatusCode.PartialContent)
@@ -237,9 +300,11 @@ namespace EmbyStrmParallel
                 }
 
                 ParallelRangeStream stream = new ParallelRangeStream(
-                    client, url, offset, effective, total, o, response, cancellationToken);
+                    client, url, offset, effective, total, o,
+                    new PreOpenedChunk(response, probePermit), cancellationToken);
                 handedOff = true;
                 clientHandedOff = true;
+                probePermit = null;
 
                 if (FetchLog.IsEnabled)
                 {
@@ -252,6 +317,14 @@ namespace EmbyStrmParallel
                             ? "(clamped by max-origin-connections=" + o.MaxOriginConnections + ")"
                             : "") +
                         " originBudget=" + o.MaxOriginConnections +
+                        // How long the probe queued for its slot. The closing line's permitWait
+                        // only covers the workers, so without this a stream that took seconds to
+                        // open because the origin was saturated looks identical to one that did
+                        // not - and "why did playback take so long to start" is the question this
+                        // whole budget makes it possible to answer.
+                        (probePermitWaitMs >= 100
+                            ? " openWait=" + (probePermitWaitMs / 1000.0).ToString("0.0", CultureInfo.InvariantCulture) + "s"
+                            : "") +
                         " chunk=" + FetchLog.Size(o.ChunkSize) +
                         " firstChunk=" + FetchLog.Size(o.FirstChunkSize) +
                         " chunks=" + stream.ChunkCount +
@@ -264,6 +337,9 @@ namespace EmbyStrmParallel
             finally
             {
                 if (!handedOff) { try { response.Dispose(); } catch { } }
+                // Nulled at each hand-off site, so this covers exactly the paths that kept
+                // neither the probe body nor a stream built from it.
+                if (probePermit != null) probePermit.Dispose();
             }
         }
 
@@ -274,10 +350,10 @@ namespace EmbyStrmParallel
         }
 
         private static HttpResponseMessage SendProbe(HttpClient client, string url, long from, long toInclusive,
-                                                     ParallelFetchOptions o, bool refuseWholeBody,
+                                                     ParallelFetchOptions o, bool refuseWholeBody, long deadline,
                                                      out bool wentOpenEnded, CancellationToken cancellationToken)
         {
-            ProbeResult r = SendProbeAsync(client, url, from, toInclusive, o, refuseWholeBody, cancellationToken)
+            ProbeResult r = SendProbeAsync(client, url, from, toInclusive, o, refuseWholeBody, deadline, cancellationToken)
                             .GetAwaiter().GetResult();
             wentOpenEnded = r.OpenEnded;
             return r.Response;
@@ -294,16 +370,16 @@ namespace EmbyStrmParallel
         /// the throw becomes a null from TryOpen and Emby serves the request itself.
         /// </summary>
         private static async Task<ProbeResult> SendProbeAsync(HttpClient client, string url, long from, long toInclusive,
-                                                              ParallelFetchOptions o, bool refuseWholeBody,
+                                                              ParallelFetchOptions o, bool refuseWholeBody, long deadline,
                                                               CancellationToken cancellationToken)
         {
             int attempt = 0;
             // -1 once we have fallen back to "bytes=<from>-".
             long rangeEnd = toInclusive;
-            // Open() blocks the caller for this whole thing, so the total is capped, not just
-            // each attempt. Four attempts x one header timeout each would otherwise pin a host
-            // request thread for over a minute.
-            long deadline = Environment.TickCount64 + (long)o.StallBudget.TotalMilliseconds;
+            // The deadline is the CALLER's: Open() blocks the caller for the permit wait and this
+            // whole retry loop together, so the total is capped, not just each attempt. Four
+            // attempts x one header timeout each would otherwise pin a host request thread for
+            // over a minute.
             while (true)
             {
                 bool timedOut = false;

@@ -441,13 +441,36 @@ namespace EmbyStrmParallel.Tests
             await DisposeMidStreamAsync(ct).ConfigureAwait(false);
             await WorkerStartupFailureAsync(ct).ConfigureAwait(false);
 
+            await BudgetsAsync(ct).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// The origin budget, reachable on its own as `run-tests.sh budget`.
+        ///
+        /// These are the slowest tests in the file and the ones most often iterated on, and the
+        /// audit of the first budget implementation had to reconstruct exactly this entry point
+        /// by hand-editing a copy of the tree before it could run mutation experiments. A named
+        /// subset costs one line and makes that reproducible.
+        /// </summary>
+        internal static async Task BudgetsAsync(CancellationToken ct)
+        {
             Harness.Section("origin connection budget");
 
             await BudgetCapsConcurrencyAsync(ct).ConfigureAwait(false);
+            await BudgetStarvesNoStreamAsync(ct).ConfigureAwait(false);
             await BudgetNeverLeaksPermitsAsync(ct).ConfigureAwait(false);
             await BudgetIsPerOriginAsync(ct).ConfigureAwait(false);
             await BudgetReleasedOnDisposeAsync(ct).ConfigureAwait(false);
             await BudgetBelowConnectionsAsync(ct).ConfigureAwait(false);
+            // Ordered before the tests that can block a thread: a mutant that makes a permit wait
+            // unbounded is caught here in under a second, instead of wedging the runner in
+            // BudgetDeclinesWhenFull and never reaching anything after it.
+            await BudgetLimitChangeAsync(ct).ConfigureAwait(false);
+            await BudgetQueuingIsNotAStallAsync(ct).ConfigureAwait(false);
+            await BudgetDeclinesWhenFullAsync(ct).ConfigureAwait(false);
+            await BudgetSurvivesAStalledReaderAsync(ct).ConfigureAwait(false);
+            await BudgetFreedDuringBackoffAsync(ct).ConfigureAwait(false);
+            await BudgetWithConnectionRampAsync(ct).ConfigureAwait(false);
         }
 
         private static ParallelFetchOptions Budgeted(int connections, int budget)
@@ -459,20 +482,31 @@ namespace EmbyStrmParallel.Tests
             return o;
         }
 
-        /// <summary>Opens a stream and reads it slowly in the background until cancelled.</summary>
-        private static Task RunUntilCancelledAsync(string url, ParallelFetchOptions o, CancellationToken ct)
+        /// <summary>
+        /// Opens a stream and reads it slowly in the background until cancelled, resolving to the
+        /// bytes it managed to deliver.
+        ///
+        /// The byte count is the point: a budget test that only looks at permit counters cannot
+        /// tell "shared fairly" from "this stream never ran at all", and the first budget
+        /// implementation failed exactly there.
+        /// </summary>
+        private static Task<long> RunUntilCancelledAsync(string url, ParallelFetchOptions o, CancellationToken ct)
         {
-            return Task.Run(async () =>
+            // Progress is recorded as it happens, not returned by DrainAsync: cancellation is how
+            // these tests end, and a cancelled DrainAsync throws away its own return value.
+            long[] got = new long[1];
+            return Task.Run<long>(async () =>
             {
                 try
                 {
                     long? t, c;
                     using (Stream s = ParallelFetch.OpenWith(url, 0, 0, o, out t, out c, ct))
                     {
-                        await Harness.DrainAsync(s, 32 * 1024, 1, ct, null).ConfigureAwait(false);
+                        await Harness.DrainAsync(s, 32 * 1024, 1, ct, n => Volatile.Write(ref got[0], n)).ConfigureAwait(false);
                     }
                 }
                 catch { /* cancellation and origin faults are the point of these tests */ }
+                return Volatile.Read(ref got[0]);
             });
         }
 
@@ -502,13 +536,25 @@ namespace EmbyStrmParallel.Tests
                         run.Cancel();
                         await Task.WhenAll(streams).ConfigureAwait(false);
 
+                        // Lower bound first. Every other assertion here is an upper bound, and
+                        // `Peak`/`MaxConcurrent` both start at 0, so a change that stopped these
+                        // streams from opening at all - a chunk-arithmetic bug, a port clash, a
+                        // buffer size - would turn this test into a no-op that still reports PASS.
+                        // Measured, not estimated: the budget is fully subscribed here.
+                        Harness.Assert(peakPermits >= 12,
+                            "the budget was never fully subscribed (peaked at " + peakPermits +
+                            "), so this test proved nothing about the cap");
                         Harness.Assert(peakPermits <= 12,
                             "permits peaked at " + peakPermits + ", budget was 12");
-                        // The probe deliberately takes no permit (it runs on a host request
-                        // thread and must never block), so the origin can briefly see one extra
-                        // per stream on top of the budget.
-                        Harness.Assert(peakAtOrigin <= 12 + streams.Length,
-                            "origin saw " + peakAtOrigin + " concurrent; budget 12 + " + streams.Length + " probes");
+                        // The probe takes a permit too (ParallelFetch.OpenCore), and a permit is
+                        // returned only after its response has been disposed - so the origin
+                        // never sees more than the budget, not "the budget plus one per stream".
+                        // The old allowance of +1 per stream dated from when the probe ran
+                        // outside the budget, and it left enough slack to hide a regression where
+                        // every stream leaked one connection.
+                        Harness.Assert(peakAtOrigin <= 12,
+                            "origin saw " + peakAtOrigin + " concurrent requests; the budget is 12 and " +
+                            "the probe is inside it");
                         // Dispose deliberately does not block on worker unwind (it can run on a
                         // host request thread), so permits come back a moment later. Promptness
                         // is asserted separately in "abandoning a stream returns its permits at
@@ -517,6 +563,80 @@ namespace EmbyStrmParallel.Tests
                             await Task.Delay(50, ct).ConfigureAwait(false);
                         Harness.AssertEqual(0, OriginBudget.InUse(key), "permits still held after teardown");
                         return "4 streams x 6 conn -> permits peaked " + peakPermits + ", origin saw " + peakAtOrigin;
+                    }
+                }
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// A cap that some streams never get under is not a budget, it is a queue with a door
+        /// policy. The first implementation took one permit per WORKER and held it for the
+        /// worker's whole life, so `max-origin-connections / connections` was really "how many
+        /// streams may play at once": at 12 / 4 the third viewer's workers parked on the
+        /// semaphore forever, its reader parked on a slot that was never filled, and playback
+        /// froze with no error, no log line and no fallback - the worst failure this component
+        /// can produce.
+        ///
+        /// Staggered starts rather than a simultaneous burst, so the oversubscription is a fact
+        /// rather than a race: A takes its four, B takes the last four, and C is left facing a
+        /// budget that is fully committed. Every stream must still deliver bytes.
+        /// </summary>
+        private static async Task BudgetStarvesNoStreamAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("an oversubscribed budget slows every stream, starves none", async () =>
+            {
+                using (MockServer srv = new MockServer(256L * 1024 * 1024, fastContent: true))
+                {
+                    srv.ThrottleBytesPerSec = 512 * 1024;
+                    OriginBudget.ResetForTests();
+                    string key = OriginBudget.KeyFor(srv.Url);
+
+                    // 3 x 4 connections against a budget of 8: the third stream can only run if
+                    // permits circulate.
+                    ParallelFetchOptions o = Budgeted(connections: 4, budget: 8);
+                    using (CancellationTokenSource run = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                    {
+                        Task<long>[] streams = new Task<long>[3];
+                        for (int i = 0; i < streams.Length; i++)
+                        {
+                            streams[i] = RunUntilCancelledAsync(srv.Url, o, run.Token);
+                            await Task.Delay(600, ct).ConfigureAwait(false);   // let this one claim its share
+                        }
+
+                        await Task.Delay(4000, ct).ConfigureAwait(false);
+                        int peak = OriginBudget.Peak(key);
+                        run.Cancel();
+                        long[] delivered = await Task.WhenAll(streams).WaitAsync(TimeSpan.FromSeconds(30), ct)
+                                                     .ConfigureAwait(false);
+
+                        // Two-sided. Only the lower bound would be checked if the upper one were
+                        // left out, and a mutant that raised the effective cap would sail through
+                        // a test whose whole subject is a cap.
+                        Harness.Assert(peak >= 8,
+                            "the budget was never fully subscribed (peaked at " + peak +
+                            "), so nothing here was actually contended");
+                        Harness.Assert(peak <= 8, "permits peaked at " + peak + " against a budget of 8");
+
+                        for (int i = 0; i < delivered.Length; i++)
+                        {
+                            // Eight chunks, not one: enough to mean permits actually circulated
+                            // rather than one chunk dribbling out. Failure here is bimodal in
+                            // practice (a stream gets megabytes or exactly zero), and it has two
+                            // possible causes - permits back to worker scope, or the mock's
+                            // pacing changed - so check the mock before concluding it is the
+                            // former.
+                            Harness.Assert(delivered[i] >= 8 * 64 * 1024,
+                                "stream " + i + " delivered " + delivered[i] + " bytes in 4s while " +
+                                delivered.Length + " streams shared a budget of 8; a starved stream is a " +
+                                "frozen player, not a slow one");
+                        }
+
+                        for (int i = 0; i < 60 && OriginBudget.InUse(key) != 0; i++)
+                            await Task.Delay(50, ct).ConfigureAwait(false);
+                        Harness.AssertEqual(0, OriginBudget.InUse(key), "permits still held after teardown");
+
+                        return "3 streams x 4 conn / budget 8 -> " + string.Join(", ",
+                            Array.ConvertAll(delivered, b => Harness.MiB(b)));
                     }
                 }
             }).ConfigureAwait(false);
@@ -577,6 +697,12 @@ namespace EmbyStrmParallel.Tests
                     for (int i = 0; i < 50 && OriginBudget.InUse(key) != 0; i++)
                         await Task.Delay(100, ct).ConfigureAwait(false);
 
+                    // Lower bound before upper bound. `InUse` returns 0 for an origin that was
+                    // never touched, so "back to zero" is also what a run that never took a
+                    // single permit looks like - and every way of breaking stream startup
+                    // produces exactly that.
+                    Harness.Assert(OriginBudget.Peak(key) > 0,
+                        "no permit was ever taken against this origin, so nothing here was proved");
                     Harness.AssertEqual(0, OriginBudget.InUse(key),
                         "permits still held after 9 streams x 6 fault kinds all finished");
 
@@ -614,17 +740,34 @@ namespace EmbyStrmParallel.Tests
                         Harness.Assert(OriginBudget.InUse(OriginBudget.KeyFor(a.Url)) > 0,
                             "origin A should be holding permits by now");
 
-                        // B must be served promptly despite A being fully subscribed.
+                        // Bounded, because the defect this test exists to catch - one budget for
+                        // every origin - does not make it fail, it makes it HANG: B's workers
+                        // queue behind A forever and the elapsed-time assertion below is never
+                        // reached. Neither Harness.RunAsync nor the CI job had a timeout, so that
+                        // shape would have burned to GitHub's six-hour ceiling.
                         Stopwatch sw = Stopwatch.StartNew();
-                        Fetched got = await FetchAsync(b.Url, 0, 1024 * 1024, Budgeted(4, 4), ct).ConfigureAwait(false);
+                        Fetched got = await FetchAsync(b.Url, 0, 1024 * 1024, Budgeted(4, 4), ct)
+                                            .WaitAsync(TimeSpan.FromSeconds(10), ct).ConfigureAwait(false);
                         sw.Stop();
 
                         run.Cancel();
                         await Task.WhenAll(hogs).ConfigureAwait(false);
 
                         Harness.AssertBytesEqual(Pattern.Range(0, 1024 * 1024), got.Data, "origin B bytes");
-                        Harness.Assert(sw.Elapsed.TotalSeconds < 10,
+                        // 3s, not 10: the WaitAsync above already turns a hang into a failure, so
+                        // an assertion at the same bound could never fire. B is served in 0.0-0.1s
+                        // when the split works at all.
+                        Harness.Assert(sw.Elapsed.TotalSeconds < 3,
                             "origin B took " + sw.Elapsed.TotalSeconds.ToString("0.0") + "s while A was saturated");
+
+                        // The only budget test that never checked its permits came back - which
+                        // also makes it the only one that could not notice a leak confined to
+                        // one of two origins.
+                        string keyA = OriginBudget.KeyFor(a.Url), keyB = OriginBudget.KeyFor(b.Url);
+                        for (int i = 0; i < 60 && (OriginBudget.InUse(keyA) != 0 || OriginBudget.InUse(keyB) != 0); i++)
+                            await Task.Delay(50, ct).ConfigureAwait(false);
+                        Harness.AssertEqual(0, OriginBudget.InUse(keyA), "permits still held at origin A");
+                        Harness.AssertEqual(0, OriginBudget.InUse(keyB), "permits still held at origin B");
                         return "A saturated, B served in " + sw.Elapsed.TotalSeconds.ToString("0.0") + "s";
                     }
                 }
@@ -655,7 +798,10 @@ namespace EmbyStrmParallel.Tests
 
                     Stopwatch sw = Stopwatch.StartNew();
                     s.Dispose();
-                    for (int i = 0; i < 50 && OriginBudget.InUse(key) != 0; i++)
+                    // Polls well past the assertion below, so "took too long" is a real verdict
+                    // rather than an artefact of the loop giving up first. 200 x 20 ms = 4 s
+                    // against a 2 s bound; measured 0.02 s.
+                    for (int i = 0; i < 200 && OriginBudget.InUse(key) != 0; i++)
                         await Task.Delay(20, ct).ConfigureAwait(false);
                     sw.Stop();
 
@@ -688,8 +834,382 @@ namespace EmbyStrmParallel.Tests
                     // Degrading is not the same as breaking: it still has to deliver exact bytes.
                     Fetched got = await FetchAsync(srv.Url, 1000, 500000, raw, ct).ConfigureAwait(false);
                     Harness.AssertBytesEqual(Pattern.Range(1000, 500000), got.Data, "bytes under a clamped config");
-                    Harness.AssertEqual(0, OriginBudget.InUse(OriginBudget.KeyFor(srv.Url)), "permits after");
+
+                    string key = OriginBudget.KeyFor(srv.Url);
+                    Harness.Assert(OriginBudget.Peak(key) > 0, "no permit was ever taken; this proved nothing");
+                    // Polled, like the other three. Dispose deliberately does not block on worker
+                    // unwind, so a bare assertion here is a race that only fails when the machine
+                    // is busy: injecting 15 ms before the permit is released reddened this test
+                    // and no other.
+                    for (int i = 0; i < 50 && OriginBudget.InUse(key) != 0; i++)
+                        await Task.Delay(20, ct).ConfigureAwait(false);
+                    Harness.AssertEqual(0, OriginBudget.InUse(key), "permits after");
                     return "connections 6 -> 2, bytes still exact";
+                }
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Queuing for OUR OWN limiter is not the origin failing to make progress.
+        ///
+        /// `AcquirePermitAsync` credits the time it spent waiting back to the chunk's stall
+        /// budget, and the comment there makes a load-bearing claim: without it, heavy but
+        /// perfectly healthy contention turns into chunk failures. Nothing tested that. Deleting
+        /// the credit outright left every budget test and the whole 59-case mock suite green,
+        /// because those tests run with the default 30 s stall budget against permit waits of a
+        /// few hundred milliseconds - three orders of magnitude of slack.
+        ///
+        /// So this one inverts the ratio: a 500 ms stall budget and a budget deliberately held
+        /// shut for three times that long. With the credit the stream simply waits and finishes;
+        /// without it, the first chunk to queue dies with "made no progress for 500 ms" and takes
+        /// the stream with it.
+        /// </summary>
+        private static async Task BudgetQueuingIsNotAStallAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("queuing for the budget is not charged as an origin stall", async () =>
+            {
+                using (MockServer srv = new MockServer(8L * 1024 * 1024, fastContent: true))
+                {
+                    OriginBudget.ResetForTests();
+                    string key = OriginBudget.KeyFor(srv.Url);
+
+                    ParallelFetchOptions o = Budgeted(connections: 2, budget: 2);
+                    o.StallBudget = TimeSpan.FromMilliseconds(500);
+                    o.MaxAttempts = 2;                       // fail fast if the credit is missing
+
+                    long? t, c;
+                    Stream s = ParallelFetch.OpenWith(srv.Url, 0, 1024 * 1024, o, out t, out c, ct);
+                    try
+                    {
+                        byte[] buf = new byte[32 * 1024];
+                        int first = await s.ReadAsync(buf.AsMemory(0, buf.Length), ct).ConfigureAwait(false);
+                        Harness.Assert(first > 0, "the stream delivered nothing even before the budget was held");
+
+                        // Take everything that frees up and sit on it for 3x the stall budget.
+                        List<OriginBudget.Permit> hogged = new List<OriginBudget.Permit>();
+                        long until = Environment.TickCount64 + 1500;
+                        while (Environment.TickCount64 < until)
+                        {
+                            OriginBudget.Permit p = await OriginBudget
+                                .TryAcquireAsync(key, 2, TimeSpan.FromMilliseconds(50), ct).ConfigureAwait(false);
+                            if (p != null) hogged.Add(p);
+                            else await Task.Delay(20, ct).ConfigureAwait(false);
+                        }
+                        Harness.Assert(hogged.Count > 0, "never managed to hold the budget shut; nothing was proved");
+                        foreach (OriginBudget.Permit p in hogged) p.Dispose();
+
+                        // The stream has to have survived a wait far longer than its stall budget.
+                        byte[] rest = await Harness.ReadAllAsync(s, 32 * 1024, ct).ConfigureAwait(false);
+                        byte[] all = new byte[first + rest.Length];
+                        Array.Copy(buf, 0, all, 0, first);
+                        Array.Copy(rest, 0, all, first, rest.Length);
+                        Harness.AssertBytesEqual(Pattern.Range(0, 1024 * 1024), all,
+                            "bytes after the budget was held shut for 3x the stall budget");
+                        return "survived a 1.5s permit wait on a 0.5s stall budget, bytes exact";
+                    }
+                    finally { s.Dispose(); }
+                }
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Nothing is left to give, so decline - promptly, and in writing.
+        ///
+        /// A stream whose reader has stopped (a paused player) keeps its workers parked on the
+        /// reorder ring holding real, open origin connections, and the permits accounting for
+        /// them stay out. That is honest: the connections exist. But it means a later stream can
+        /// find the origin fully committed, and the one thing it must never do then is wait.
+        /// Open() runs on a host request thread, so an unbounded wait there is the silent freeze
+        /// this whole rework removed, arriving through the front door instead of the back.
+        ///
+        /// Declining is not a defeat: it becomes a null from TryOpen and Emby serves the request
+        /// on its own single connection, which is the correct answer when the origin has no
+        /// capacity left. And it must not be a one-way door - the budget frees up, the next
+        /// stream opens normally.
+        /// </summary>
+        private static async Task BudgetDeclinesWhenFullAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("a fully committed origin declines promptly, then recovers", async () =>
+            {
+                using (MockServer srv = new MockServer(64L * 1024 * 1024, fastContent: true))
+                {
+                    OriginBudget.ResetForTests();
+                    string key = OriginBudget.KeyFor(srv.Url);
+
+                    // Held from outside the fetcher: deterministic, and exactly what a paused
+                    // stream's parked workers do to the budget.
+                    OriginBudget.Permit[] held = new OriginBudget.Permit[3];
+                    for (int i = 0; i < held.Length; i++)
+                        held[i] = await OriginBudget.TryAcquireAsync(key, 3, TimeSpan.FromSeconds(2), ct)
+                                                    .ConfigureAwait(false);
+                    Harness.Assert(held[2] != null, "could not saturate the budget; the rest proves nothing");
+
+                    ParallelFetchOptions o = Budgeted(connections: 3, budget: 3);
+                    o.StallBudget = TimeSpan.FromSeconds(3);
+                    o.ResponseHeadersTimeout = TimeSpan.FromSeconds(1);   // leaves ~2s for the permit wait
+
+                    long? t, c;
+                    Stopwatch sw = Stopwatch.StartNew();
+                    bool declined = false;
+                    try
+                    {
+                        Stream doomed = ParallelFetch.OpenWith(srv.Url, 0, 0, o, out t, out c, ct);
+                        doomed.Dispose();
+                    }
+                    catch (IOException) { declined = true; }
+                    sw.Stop();
+
+                    Harness.Assert(declined, "opened a stream against an origin with no budget left");
+                    Harness.Assert(sw.Elapsed.TotalSeconds < 6,
+                        "took " + sw.Elapsed.TotalSeconds.ToString("0.0") + "s to decline, and that wait is on " +
+                        "a host request thread");
+
+                    for (int i = 0; i < held.Length; i++) held[i].Dispose();
+                    Harness.AssertEqual(0, OriginBudget.InUse(key), "permits back after releasing them");
+
+                    Fetched got = await FetchAsync(srv.Url, 0, 300000, o, ct).ConfigureAwait(false);
+                    Harness.AssertBytesEqual(Pattern.Range(0, 300000), got.Data, "bytes once the budget freed up");
+                    return "declined in " + sw.Elapsed.TotalSeconds.ToString("0.00") + "s, served normally after";
+                }
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// A player that pauses must not sit on the origin's budget.
+        ///
+        /// Workers park on `slot.Free` BEFORE taking a permit, so a stalled reader normally costs
+        /// nothing once the chunks already in flight have landed in their channels. What breaks
+        /// that is a chunk that needs more blocks than its channel can hold: the worker parks
+        /// inside writer.WriteAsync instead, still holding its permit, and the only thing that can
+        /// free it is a consumer that has stopped consuming.
+        ///
+        /// And a resumed chunk really does need more blocks. An attempt abandoned by the
+        /// throughput floor publishes a SHORT block before it throws, so the retry resumes off a
+        /// block boundary and crosses one extra one - and production logs ~50 of those retries in
+        /// a single session. Sizing the channel to a clean run's block count therefore leaked a
+        /// permit on an ordinary path, which is why BlocksPerChunk carries MaxAttempts of
+        /// headroom.
+        /// </summary>
+        private static async Task BudgetSurvivesAStalledReaderAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("a stalled reader gives the origin its permits back", async () =>
+            {
+                using (MockServer srv = new MockServer(64L * 1024 * 1024, fastContent: true))
+                {
+                    OriginBudget.ResetForTests();
+                    string key = OriginBudget.KeyFor(srv.Url);
+
+                    // Slow enough to trip the throughput floor, fast enough to keep this quick.
+                    // Aimed at a chunk WELL AHEAD of the reader: a chunk the consumer is actively
+                    // draining has room in its channel no matter how many blocks it takes, so
+                    // faulting chunk 0 would prove nothing.
+                    const long StalledChunkStart = 3 * 64 * 1024;
+                    srv.TrickleBytesPerSec = 20000;
+                    int tricklesServed = 0;
+                    srv.FaultHook = (seq, from, to) =>
+                    {
+                        if (from != StalledChunkStart || Volatile.Read(ref tricklesServed) != 0) return MockFault.None;
+                        Interlocked.Increment(ref tricklesServed);
+                        return MockFault.Trickle;
+                    };
+
+                    ParallelFetchOptions o = Budgeted(connections: 2, budget: 4);
+                    o.MinThroughputGrace = TimeSpan.FromMilliseconds(200);
+
+                    try
+                    {
+                        long? t, c;
+                        using (Stream s = ParallelFetch.OpenWith(srv.Url, 0, 0, o, out t, out c, ct))
+                        {
+                            byte[] buf = new byte[32 * 1024];
+                            await s.ReadAsync(buf.AsMemory(0, buf.Length), ct).ConfigureAwait(false);
+
+                            // Stop reading. Every worker should finish the chunk it is on, hand
+                            // its permit back, and then park on a full reorder ring holding
+                            // nothing.
+                            for (int i = 0; i < 100 && OriginBudget.InUse(key) != 0; i++)
+                                await Task.Delay(100, ct).ConfigureAwait(false);
+
+                            Harness.Assert(Volatile.Read(ref tricklesServed) > 0,
+                                "the throughput floor was never provoked, so no chunk was ever resumed " +
+                                "and this test proved nothing");
+                            Harness.Assert(OriginBudget.Peak(key) > 0, "no permit was ever taken");
+                            Harness.AssertEqual(0, OriginBudget.InUse(key),
+                                "permits still held 10s after the consumer stopped reading");
+
+                            // Still alive, not just quiet: resuming has to work.
+                            int n = await s.ReadAsync(buf.AsMemory(0, buf.Length), ct).ConfigureAwait(false);
+                            Harness.Assert(n > 0, "the stream delivered nothing after the reader resumed");
+                        }
+                    }
+                    finally { srv.FaultHook = null; }
+
+                    for (int i = 0; i < 60 && OriginBudget.InUse(key) != 0; i++)
+                        await Task.Delay(50, ct).ConfigureAwait(false);
+                    Harness.AssertEqual(0, OriginBudget.InUse(key), "permits after dispose");
+                    return "paused with a resumed chunk in flight, permits back to 0";
+                }
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// A chunk waiting out a retry backoff has nothing in flight at the origin, so it must not
+        /// be holding a slot in the origin's budget either.
+        ///
+        /// The backoff used to be slept INSIDE the catch, which runs before the finally that
+        /// releases the permit and the dead response - so a `Retry-After: 3600` (clamped to the
+        /// stall budget, but still tens of seconds) could park every chunk in the process asleep
+        /// on the whole budget, at exactly the moment the origin is saying it is under pressure.
+        ///
+        /// Measured as the longest unbroken run of "budget idle" while the fetch is still going:
+        /// with the release before the sleep it is the length of the backoff, without it, zero.
+        /// </summary>
+        private static async Task BudgetFreedDuringBackoffAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("a chunk waiting out a backoff is not holding the budget", async () =>
+            {
+                using (MockServer srv = new MockServer(FileSize, fastContent: false))
+                {
+                    OriginBudget.ResetForTests();
+                    string key = OriginBudget.KeyFor(srv.Url);
+
+                    srv.RetryAfter = "2";                       // long enough to see, short enough to wait for
+                    srv.FaultHook = (seq, f, t) => seq == 2 ? MockFault.Status503RetryAfter : MockFault.None;
+
+                    ParallelFetchOptions o = Budgeted(connections: 1, budget: 1);
+                    long idleRun = 0, longestIdleRun = 0;
+                    try
+                    {
+                        Task<Fetched> fetch = FetchAsync(srv.Url, 0, 256 * 1024, o, ct);
+                        while (!fetch.IsCompleted)
+                        {
+                            await Task.Delay(20, ct).ConfigureAwait(false);
+                            if (OriginBudget.InUse(key) == 0)
+                            {
+                                idleRun += 20;
+                                if (idleRun > longestIdleRun) longestIdleRun = idleRun;
+                            }
+                            else idleRun = 0;
+                        }
+                        Fetched got = await fetch.WaitAsync(TimeSpan.FromSeconds(30), ct).ConfigureAwait(false);
+                        Harness.AssertBytesEqual(Pattern.Range(0, 256 * 1024), got.Data, "bytes after the 503");
+                    }
+                    finally { srv.FaultHook = null; srv.RetryAfter = null; }
+
+                    Harness.Assert(OriginBudget.Peak(key) > 0, "no permit was ever taken; this proved nothing");
+                    Harness.Assert(srv.RequestTicks.Count >= 3, "the 503 never produced a retry");
+                    Harness.Assert(longestIdleRun >= 1000,
+                        "the budget was never idle for more than " + longestIdleRun + " ms during a 2s backoff; " +
+                        "the permit is being held across the sleep");
+                    return "budget idle " + longestIdleRun + " ms of a 2s backoff";
+                }
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// `max-origin-connections` is live-reloadable like every other setting, which means the
+        /// semaphore behind it has to be replaced while the process runs. Driven straight against
+        /// OriginBudget rather than through streams: the swap is a property of the budget, and
+        /// going through a stream would turn a fact into a timing race.
+        ///
+        /// The half that matters is the half that does NOT swap. Replacing the gate while permits
+        /// are out strands everyone already queued on the old one - they are waiting on an object
+        /// nobody will ever release - and a stranded waiter is exactly the invisible freeze this
+        /// class exists to prevent. Attempt-scoped permits make waiting for the idle moment cheap:
+        /// InUse reaches zero every few seconds.
+        ///
+        /// NOT COVERED, and not coverable from here: the `Waiting == 0` half of that guard. It
+        /// exists for the instant between `WaitAsync` returning and `InUse` being raised, where
+        /// a caller already owns a permit while the entry still looks idle. Reaching that instant
+        /// on purpose needs a hook inside OriginBudget, and a test-only hook in the freeze-critical
+        /// path costs more than it buys. The guard is justified by construction instead: `Waiting`
+        /// is raised inside the same `lock (e)` the swap has to take, so a swap either sees it or
+        /// has not published its gate yet. Deleting that condition WILL leave this test green.
+        /// </summary>
+        private static async Task BudgetLimitChangeAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("a changed budget applies when idle, never mid-flight", async () =>
+            {
+                OriginBudget.ResetForTests();
+                const string Key = "https://limit.example:443";
+                TimeSpan brief = TimeSpan.FromMilliseconds(200);
+
+                OriginBudget.Permit p1 = await OriginBudget.TryAcquireAsync(Key, 2, TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+                OriginBudget.Permit p2 = await OriginBudget.TryAcquireAsync(Key, 2, TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+                Harness.Assert(p1 != null && p2 != null, "the first two permits at a limit of 2");
+                Harness.Assert(await OriginBudget.TryAcquireAsync(Key, 2, brief, ct).ConfigureAwait(false) == null,
+                    "a third permit came out of a budget of 2");
+
+                // Raising the limit while two are out must be deferred, not applied.
+                Harness.Assert(await OriginBudget.TryAcquireAsync(Key, 6, brief, ct).ConfigureAwait(false) == null,
+                    "the raised limit was applied mid-flight, which strands anyone on the old gate");
+                Harness.AssertEqual(2, OriginBudget.Limit(Key), "limit must not move while permits are out");
+
+                p1.Dispose();
+                p2.Dispose();
+                Harness.AssertEqual(0, OriginBudget.InUse(Key), "permits back before the change");
+
+                OriginBudget.Permit[] six = new OriginBudget.Permit[6];
+                for (int i = 0; i < six.Length; i++)
+                {
+                    six[i] = await OriginBudget.TryAcquireAsync(Key, 6, TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+                    Harness.Assert(six[i] != null, "permit " + i + " at the raised limit of 6");
+                }
+                Harness.AssertEqual(6, OriginBudget.Limit(Key), "limit after the origin went idle");
+                Harness.Assert(await OriginBudget.TryAcquireAsync(Key, 6, brief, ct).ConfigureAwait(false) == null,
+                    "a seventh permit came out of a budget of 6");
+
+                for (int i = 0; i < six.Length; i++) six[i].Dispose();
+                Harness.AssertEqual(0, OriginBudget.InUse(Key), "permits back after the change");
+                Harness.AssertEqual(6, OriginBudget.Peak(Key), "high-water mark across the change");
+                return "2 -> deferred while busy -> 6 once idle, no restart";
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Every other budget test runs with the connection ramp switched off, while production
+        /// runs it at 2-6 seconds. The ramp is the one thing that decides WHEN a worker first
+        /// asks for a permit, so "budget with the ramp on" is a different arrangement of the same
+        /// two mechanisms and was completely uncovered.
+        /// </summary>
+        private static async Task BudgetWithConnectionRampAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("the cap holds with connection slow-start on", async () =>
+            {
+                using (MockServer srv = new MockServer(128L * 1024 * 1024, fastContent: true))
+                {
+                    srv.ThrottleBytesPerSec = 512 * 1024;
+                    OriginBudget.ResetForTests();
+                    string key = OriginBudget.KeyFor(srv.Url);
+
+                    ParallelFetchOptions o = Budgeted(connections: 4, budget: 6);
+                    o.InitialConnections = 1;
+                    o.ConnectionRampInterval = TimeSpan.FromMilliseconds(300);
+
+                    using (CancellationTokenSource run = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                    {
+                        Task<long>[] streams = new Task<long>[2];
+                        for (int i = 0; i < streams.Length; i++)
+                            streams[i] = RunUntilCancelledAsync(srv.Url, o, run.Token);
+
+                        await Task.Delay(3000, ct).ConfigureAwait(false);
+                        int peak = OriginBudget.Peak(key);
+                        run.Cancel();
+                        long[] delivered = await Task.WhenAll(streams).WaitAsync(TimeSpan.FromSeconds(30), ct)
+                                                     .ConfigureAwait(false);
+
+                        Harness.Assert(peak >= 5,
+                            "peaked at " + peak + ": the two ramped streams never actually contended, so " +
+                            "this ran without exercising the budget at all");
+                        Harness.Assert(peak <= 6, "permits peaked at " + peak + " with a budget of 6");
+                        for (int i = 0; i < delivered.Length; i++)
+                            Harness.Assert(delivered[i] > 0, "ramped stream " + i + " delivered nothing");
+
+                        for (int i = 0; i < 60 && OriginBudget.InUse(key) != 0; i++)
+                            await Task.Delay(50, ct).ConfigureAwait(false);
+                        Harness.AssertEqual(0, OriginBudget.InUse(key), "permits still held after teardown");
+                        return "ramped 1 -> 4 per stream, peaked " + peak + " of 6";
+                    }
                 }
             }).ConfigureAwait(false);
         }
@@ -1118,7 +1638,8 @@ namespace EmbyStrmParallel.Tests
                         .SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
 
                     Stopwatch sw = Stopwatch.StartNew();
-                    using (Stream s = new ParallelRangeStream(client, srv.Url, 0, Length, FileSize, o, probe, ct))
+                    using (Stream s = new ParallelRangeStream(client, srv.Url, 0, Length, FileSize, o,
+                                                              new PreOpenedChunk(probe, null), ct))
                     using (CancellationTokenSource guard = CancellationTokenSource.CreateLinkedTokenSource(ct))
                     {
                         guard.CancelAfter(TimeSpan.FromSeconds(15));

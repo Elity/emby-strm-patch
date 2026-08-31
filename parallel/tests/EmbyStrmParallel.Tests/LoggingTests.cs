@@ -223,7 +223,7 @@ namespace EmbyStrmParallel.Tests
                         string text = File.ReadAllText(logPath);
                         Harness.Assert(text.Contains("closed complete"), "no completion summary: " + text);
                         Harness.Assert(text.Contains("closed ABANDONED"), "no abandonment summary: " + text);
-                        foreach (string field in new string[] { "delivered=", "elapsed=", "rate=", "chunks=", "retries=", "slow=" })
+                        foreach (string field in new string[] { "delivered=", "elapsed=", "rate=", "chunks=", "retries=", "slow=", "permitWait=" })
                         {
                             Harness.Assert(text.Contains(field), "summary is missing " + field + ": " + text);
                         }
@@ -234,6 +234,132 @@ namespace EmbyStrmParallel.Tests
                     }
                 }
                 finally { Disarm(); try { Directory.Delete(dir, true); } catch { } }
+            }).ConfigureAwait(false);
+
+            await Harness.RunAsync("a stream throttled by the origin budget says so in permitWait", async () =>
+            {
+                // The counter that has to work on the day it matters.
+                //
+                // In production a stream spent eleven minutes with half its workers frozen on the
+                // origin budget and reported `permitWait=0.0s` - because the accumulation sat
+                // AFTER the await, so a wait that ended in cancellation contributed nothing.
+                // The number read zero precisely when the budget was the culprit, which is worse
+                // than having no counter at all: it actively pointed the diagnosis elsewhere.
+                //
+                // Asserted on the rendered line rather than on the field, because the rendering is
+                // the part an operator actually reads.
+                string dir = NewTempDir();
+                string logPath = Path.Combine(dir, "parallel.log");
+                Arm(logPath);
+                try
+                {
+                    using (MockServer srv = new MockServer(32L * 1024 * 1024, fastContent: true))
+                    {
+                        srv.ThrottleBytesPerSec = 256 * 1024;
+                        OriginBudget.ResetForTests();
+                        string key = OriginBudget.KeyFor(srv.Url);
+
+                        ParallelFetchOptions o = Small();
+                        o.Connections = 4;
+                        o.MaxOriginConnections = 4;
+                        o.MaxBufferBytes = 64L * 64 * 1024;
+
+                        // Hold most of the budget from outside, so this stream's workers have to
+                        // queue for real rather than sail through.
+                        OriginBudget.Permit[] held = new OriginBudget.Permit[3];
+                        for (int i = 0; i < held.Length; i++)
+                            held[i] = await OriginBudget.TryAcquireAsync(key, 4, TimeSpan.FromSeconds(2), ct)
+                                                        .ConfigureAwait(false);
+                        Harness.Assert(held[2] != null, "could not tie up the budget");
+
+                        long? t, cl;
+                        Stream s = ParallelFetch.OpenWith(srv.Url, 0, 4 * 1024 * 1024, o, out t, out cl, ct);
+                        byte[] buf = new byte[32 * 1024];
+                        await s.ReadAsync(buf.AsMemory(0, buf.Length), ct).ConfigureAwait(false);
+                        await Task.Delay(1200, ct).ConfigureAwait(false);   // let the queued workers accumulate
+                        for (int i = 0; i < held.Length; i++) held[i].Dispose();
+                        s.Dispose();
+
+                        for (int i = 0; i < 60 && OriginBudget.InUse(key) != 0; i++)
+                            await Task.Delay(50, ct).ConfigureAwait(false);
+
+                        string text = File.ReadAllText(logPath);
+                        string summary = null;
+                        foreach (string l in text.Trim().Split('\n')) if (l.Contains(" closed ")) summary = l;
+                        Harness.Assert(summary != null, "no close summary at all: " + text);
+                        int at = summary.IndexOf("permitWait=", StringComparison.Ordinal);
+                        Harness.Assert(at >= 0, "no permitWait field: " + summary);
+                        string value = summary.Substring(at + "permitWait=".Length).Split('s')[0];
+                        double seconds;
+                        Harness.Assert(double.TryParse(value, System.Globalization.NumberStyles.Float,
+                                                       System.Globalization.CultureInfo.InvariantCulture, out seconds),
+                                       "permitWait is not a number: " + summary);
+                        Harness.Assert(seconds > 0,
+                            "permitWait read " + value + "s while the budget was deliberately tied up; " +
+                            "the one number that identifies the budget as the culprit is dead: " + summary);
+                        return "permitWait=" + value + "s under a tied-up budget";
+                    }
+                }
+                finally { Disarm(); try { Directory.Delete(dir, true); } catch { } }
+            }).ConfigureAwait(false);
+
+            await Harness.RunAsync("a stream closing with starved workers reports blockedOnBudget", async () =>
+            {
+                // The production shape, exactly. A stream is abandoned while some of its workers
+                // are still queued on the origin budget, and the summary is written from the
+                // disposing thread BEFORE those workers unwind - so no amount of fixing where the
+                // elapsed time is accumulated can make it visible. The waiter COUNT is raised
+                // before the wait starts, which is why it survives that ordering.
+                //
+                // Without it the log said `permitWait=0.0s` for the one stream that had spent
+                // eleven minutes starved, and the diagnosis went looking at the origin instead.
+                string dir = NewTempDir();
+                string logPath = Path.Combine(dir, "parallel.log");
+                Arm(logPath);
+                OriginBudget.Permit[] held = new OriginBudget.Permit[3];
+                try
+                {
+                    using (MockServer srv = new MockServer(32L * 1024 * 1024, fastContent: true))
+                    {
+                        srv.ThrottleBytesPerSec = 256 * 1024;
+                        OriginBudget.ResetForTests();
+                        string key = OriginBudget.KeyFor(srv.Url);
+
+                        ParallelFetchOptions o = Small();
+                        o.Connections = 4;
+                        o.MaxOriginConnections = 4;
+                        o.MaxBufferBytes = 64L * 64 * 1024;
+
+                        // Leave exactly one permit free: enough for the probe (and so chunk 0),
+                        // not enough for anyone else. Never released - the workers are still
+                        // waiting when the stream is thrown away.
+                        for (int i = 0; i < held.Length; i++)
+                            held[i] = await OriginBudget.TryAcquireAsync(key, 4, TimeSpan.FromSeconds(2), ct)
+                                                        .ConfigureAwait(false);
+                        Harness.Assert(held[2] != null, "could not tie up the budget");
+
+                        long? t, cl;
+                        Stream s = ParallelFetch.OpenWith(srv.Url, 0, 4 * 1024 * 1024, o, out t, out cl, ct);
+                        byte[] buf = new byte[32 * 1024];
+                        await s.ReadAsync(buf.AsMemory(0, buf.Length), ct).ConfigureAwait(false);
+                        await Task.Delay(800, ct).ConfigureAwait(false);
+                        s.Dispose();                    // budget still tied up: workers are queued
+
+                        string text = File.ReadAllText(logPath);
+                        string summary = null;
+                        foreach (string l in text.Trim().Split('\n')) if (l.Contains(" closed ")) summary = l;
+                        Harness.Assert(summary != null, "no close summary at all: " + text);
+                        Harness.Assert(summary.Contains("blockedOnBudget="),
+                            "the stream closed with workers queued on the budget and did not say so: " + summary);
+                        return summary.Substring(summary.IndexOf("blockedOnBudget=", StringComparison.Ordinal));
+                    }
+                }
+                finally
+                {
+                    for (int i = 0; i < held.Length; i++) if (held[i] != null) held[i].Dispose();
+                    Disarm();
+                    try { Directory.Delete(dir, true); } catch { }
+                }
             }).ConfigureAwait(false);
 
             await Harness.RunAsync("unwritable log path never breaks a request", async () =>

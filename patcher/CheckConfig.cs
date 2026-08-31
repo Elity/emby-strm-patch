@@ -209,8 +209,8 @@ internal static class CheckConfig
         // a second one starves until the first ends. The fetcher degrades by lowering
         // `connections`, but that is worth saying out loud HERE - before anything is played -
         // rather than leaving it to be noticed in a log line during playback.
-        int perStream = SettingAsInt("connections", 6);
-        int budget    = SettingAsInt("max-origin-connections", 12);
+        int perStream = SettingAsInt("connections");
+        int budget    = SettingAsInt("max-origin-connections");
         if (perStream > budget)
         {
             warns.Add($"connections ({perStream}) exceeds max-origin-connections ({budget}); " +
@@ -443,12 +443,22 @@ internal static class CheckConfig
         return result;
     }
 
-    /// <summary>A setting as a number, falling back to the built-in default when unset or unparseable.</summary>
-    private static int SettingAsInt(string key, int fallback)
+    /// <summary>
+    /// A numeric setting, falling back to the default from SettingKeys() rather than to a second
+    /// copy of it written out here. Two copies of "the default for connections" drift silently:
+    /// the printed table would say one number while the cross-setting warning reasoned about
+    /// another, and both would look right on their own line.
+    /// </summary>
+    private static int SettingAsInt(string key)
     {
         string raw = StrmDirect.GetSetting(key);
         int v;
-        return !string.IsNullOrWhiteSpace(raw) && int.TryParse(raw.Trim(), out v) && v > 0 ? v : fallback;
+        if (!string.IsNullOrWhiteSpace(raw) && int.TryParse(raw.Trim(), out v) && v > 0) return v;
+        foreach ((string Key, string Default) s in SettingKeys())
+        {
+            if (s.Key == key && int.TryParse(s.Default, out v)) return v;
+        }
+        return 0;
     }
 
     private static string EnvNameOf(string key)
@@ -489,11 +499,6 @@ internal static class CheckConfig
     private static string[] Routes()
     {
         return Pairs("GetRoutes", "_routes");
-    }
-
-    private static string[] SettingsRead()
-    {
-        return Pairs("GetSettings", "_settings");
     }
 
     private static string NonAsciiSample(string s)

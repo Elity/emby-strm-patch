@@ -22,6 +22,7 @@ namespace EmbyStrmParallel.Tests
                 CancellationToken ct = cts.Token;
 
                 bool wantMock = mode == "all" || mode == "mock";
+                bool wantBudget = mode == "budget";
                 bool wantConfig = mode == "all" || mode == "config";
                 bool wantLogging = mode == "all" || mode == "config" || mode == "logging";
                 bool wantLive = mode == "all" || mode == "live" || mode == "correctness-live";
@@ -35,9 +36,14 @@ namespace EmbyStrmParallel.Tests
                 if (wantConfig) await ConfigTests.RunAsync().ConfigureAwait(false);
                 if (wantLogging) await LoggingTests.RunAsync(ct).ConfigureAwait(false);
                 if (wantMock) await MockTests.RunAsync(ct).ConfigureAwait(false);
+                if (wantBudget) await MockTests.BudgetsAsync(ct).ConfigureAwait(false);
 
                 if (wantLive || wantThroughput || wantSoak || wantTune || wantMeasure || wantRamp || wantSeeks)
                 {
+                    // Live modes are sweeps and soaks against a real origin: minutes per test is
+                    // the job, not a hang. The offline suites keep the ceiling.
+                    Harness.PerTestTimeout = TimeSpan.Zero;
+
                     string reason;
                     if (!LiveTests.TryLoadUrl(out reason))
                     {

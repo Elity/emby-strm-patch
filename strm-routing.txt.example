@@ -42,17 +42,23 @@ https://other.example/                             # no token = 302
 # that file and leaves programdata/ alone — tuning that vanishes on upgrade shows
 # up months later as "it started stuttering again" and nobody suspects the knobs.
 #
-#   ramp-seconds          6      EMBY_STRM_RAMP_SECONDS          seconds between added connections
-#   connections           8      EMBY_STRM_CONNECTIONS           concurrent Range requests
-#   chunk-mb              8      EMBY_STRM_CHUNK_MB              bytes per Range request
-#   buffer-mb           128      EMBY_STRM_BUFFER_MB             reorder buffer ceiling
-#   initial-connections   2      EMBY_STRM_INITIAL_CONNECTIONS   connections opened immediately
-#   log                 off      EMBY_STRM_LOG                   diagnostics file path
+#   ramp-seconds            6      EMBY_STRM_RAMP_SECONDS          seconds between added connections
+#   connections             6      EMBY_STRM_CONNECTIONS           concurrent Range requests, per stream
+#   max-origin-connections 12      EMBY_STRM_MAX_ORIGIN_CONNECTIONS  cap across ALL streams, per origin
+#   chunk-mb                8      EMBY_STRM_CHUNK_MB              bytes per Range request
+#   buffer-mb             128      EMBY_STRM_BUFFER_MB             reorder buffer ceiling
+#   initial-connections     2      EMBY_STRM_INITIAL_CONNECTIONS   connections opened immediately
+#   log                   off      EMBY_STRM_LOG                   diagnostics file path
+#
+# connections is per STREAM; max-origin-connections is what the ORIGIN sees, across every
+# stream in the process. Seeking makes the two disagree — abandoning a stream does not free
+# its connections at the origin instantly — so the second number is the one that keeps a burst
+# of seeks, or a third viewer, from crossing whatever cliff your origin has. Set it below
+# connections and the fetcher lowers connections to match, and says so.
 #
 # ramp-seconds is the one worth tuning per origin, and it has a cliff at 1.
-# Sweep it against your own origin with `parallel/run-tests.sh seeks 25` before changing it
-# (the header of that script has the method and a measured table), and only after
-# parallel/probe-origin.sh says your origin throttles per connection.
+# Sweep it against your own origin before changing it (run-tests.sh seeks 25),
+# and only after parallel/probe-origin.sh says your origin throttles per connection.
 
 # ramp-seconds = 2
 # log = /var/packages/EmbyServer/target/programdata/logs/strm-parallel.log

@@ -26,10 +26,24 @@ namespace EmbyStrmParallel
         internal SlowConnectionException(string message) : base(message) { }
     }
 
+    /// <summary>
+    /// No origin permit arrived within the watchdog. Deliberately NOT retryable: another attempt
+    /// would only re-join the same queue behind the same holder that is not letting go, and four
+    /// of those in a row would take the time-to-error from bounded to eight minutes.
+    /// </summary>
+    internal sealed class OriginBudgetTimeoutException : IOException
+    {
+        internal OriginBudgetTimeoutException(string message) : base(message) { }
+    }
+
     internal sealed class ChunkDownloader
     {
+        /// <summary>Wait long enough to be worth a line in the log; short enough to see it coming.</summary>
+        private const long LongPermitWaitMs = 5000;
+
         private readonly HttpClient _client;
         private readonly string _url;
+        private readonly string _originKey;
         private readonly ParallelFetchOptions _o;
         private readonly string _tag;
         private readonly StreamStats _stats;
@@ -40,6 +54,7 @@ namespace EmbyStrmParallel
         {
             _client = client;
             _url = url;
+            _originKey = OriginBudget.KeyFor(url);
             _o = options;
             _tag = tag;
             _stats = stats;
@@ -60,18 +75,29 @@ namespace EmbyStrmParallel
         }
 
         internal async Task DownloadAsync(long start, long endInclusive, ChannelWriter<Block> writer,
-                                          HttpResponseMessage preOpened, CancellationToken ct)
+                                          PreOpenedChunk preOpened, CancellationToken ct)
         {
             Cursor cursor = new Cursor { Pos = start, LastProgressTicks = Environment.TickCount64 };
             int attempt = 0;
-            HttpResponseMessage pre = preOpened;
+            PreOpenedChunk pre = preOpened;
             long stallBudgetMs = (long)_o.StallBudget.TotalMilliseconds;
 
-            // The pre-opened probe response is a LIVE 206 body holding an origin connection.
-            // Every exit path must dispose it, including the cancellation check on the very
-            // first line of the loop - otherwise abandoning a stream before its first read
-            // leaks a connection that keeps pulling from the origin and counts against the
-            // origin's concurrency limit, throttling whatever the user opens next.
+            // One deadline for the WHOLE chunk, permit queuing included.
+            //
+            // The stall budget alone cannot bound this: queuing for our own limiter is credited
+            // back to it (see AcquirePermitAsync), so four attempts that each waited 119 s and
+            // then succeeded would stretch time-to-error past eight minutes with the consumer -
+            // which is reading in order, behind this chunk - seeing nothing at all. Bounding the
+            // wait by what is left of this deadline caps the total at stall budget + one permit
+            // timeout, however the two are divided up.
+            long chunkDeadline = Environment.TickCount64 + stallBudgetMs +
+                                 (long)_o.OriginPermitTimeout.TotalMilliseconds;
+
+            // The pre-opened probe response is a LIVE 206 body holding an origin connection, and
+            // an origin permit alongside it. Every exit path must dispose it, including the
+            // cancellation check on the very first line of the loop - otherwise abandoning a
+            // stream before its first read leaks a connection that keeps pulling from the origin,
+            // plus the permit that was accounting for it, which is unrecoverable.
             try
             {
             while (cursor.Pos <= endInclusive)
@@ -90,7 +116,9 @@ namespace EmbyStrmParallel
 
                 HttpResponseMessage response = null;
                 CancellationTokenSource phase = null;
+                OriginBudget.Permit permit = null;
                 long retryAfterMs = -1;
+                long backoffMs = -1;
                 bool fromProbe = false;
                 try
                 {
@@ -98,12 +126,32 @@ namespace EmbyStrmParallel
 
                     if (pre != null)
                     {
-                        response = pre;
+                        // Adopt both halves: the probe already paid for this connection, so
+                        // taking a second permit would double-count the same socket.
+                        response = pre.Response;
+                        permit = pre.Permit;
                         pre = null; // consumed; only valid for the very first attempt of chunk 0
                         fromProbe = true;
                     }
                     else
                     {
+                        permit = await AcquirePermitAsync(cursor, chunkDeadline, ct).ConfigureAwait(false);
+                        if (permit == null)
+                        {
+                            throw new OriginBudgetTimeoutException(
+                                "No origin permit for chunk [" + start + "-" + endInclusive + "] within " +
+                                _o.OriginPermitTimeout.TotalSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                                "s (max-origin-connections=" + _o.MaxOriginConnections + ").");
+                        }
+                        // Recomputed: waiting for our own limiter was added back to the stall
+                        // budget, so the header timeout still gets the share it was promised.
+                        remainingMs = stallBudgetMs - (Environment.TickCount64 - cursor.LastProgressTicks);
+                        if (remainingMs <= 0)
+                        {
+                            throw new IOException("Chunk [" + start + "-" + endInclusive + "] made no progress for " +
+                                                  stallBudgetMs + " ms (stopped at offset " + cursor.Pos + ").");
+                        }
+
                         double headerMs = Math.Min(_o.ResponseHeadersTimeout.TotalMilliseconds, remainingMs);
                         phase.CancelAfter(TimeSpan.FromMilliseconds(headerMs));
                         response = await SendAsync(cursor.Pos, endInclusive, phase.Token).ConfigureAwait(false);
@@ -148,19 +196,82 @@ namespace EmbyStrmParallel
                     if (delay < 0) delay = 0;
                     FetchLog.Write(_tag + " chunk [" + start + "-" + endInclusive + "] retry " + attempt + "/" +
                                    (_o.MaxAttempts - 1) + " resuming at " + cursor.Pos + " after " + FetchLog.Describe(ex));
-                    await Task.Delay((int)delay, ct).ConfigureAwait(false);
+                    // Slept AFTER the finally below, never here: nothing of ours is in flight at
+                    // the origin during a backoff, so holding the permit (and the dead response)
+                    // through it hands a Retry-After the power to park the whole budget asleep -
+                    // at exactly the moment the origin is already saying it is under pressure.
+                    backoffMs = delay;
                 }
                 finally
                 {
                     if (response != null) { try { response.Dispose(); } catch { } }
                     if (phase != null) phase.Dispose();
+                    // Last, and after the response: the connection this permit accounts for has
+                    // to be closed before the slot is offered to anyone else, or the origin
+                    // briefly sees more concurrent requests than the budget allows - which is the
+                    // exact overshoot the budget exists to prevent.
+                    if (permit != null) permit.Dispose();
                 }
+
+                if (backoffMs > 0) await Task.Delay((int)backoffMs, ct).ConfigureAwait(false);
             }
             }
             finally
             {
-                // Unconsumed probe response (cancelled before the first attempt got to use it).
+                // Unconsumed probe response and its permit (cancelled before the first attempt
+                // got to use them).
                 if (pre != null) { try { pre.Dispose(); } catch { } }
+            }
+        }
+
+        /// <summary>
+        /// Takes an origin permit for ONE attempt.
+        ///
+        /// Attempt-scoped rather than worker-scoped, which is the difference between throttling
+        /// and rationing: a worker only exits when its stream is finished, so a worker-scoped
+        /// permit meant `max-origin-connections / connections` was really the number of streams
+        /// allowed to play at once, and every stream past that froze on a semaphore with no
+        /// error and no fallback.
+        ///
+        /// Time spent queuing is added back to the chunk's stall budget. Waiting for our OWN
+        /// limiter is not the origin failing to make progress, and charging it there would turn
+        /// heavy - but perfectly healthy - contention into chunk failures. The overall
+        /// <paramref name="chunkDeadline"/> is what keeps that credit from being unbounded.
+        /// </summary>
+        private async Task<OriginBudget.Permit> AcquirePermitAsync(Cursor cursor, long chunkDeadline,
+                                                                   CancellationToken ct)
+        {
+            long waitStart = Environment.TickCount64;
+            long budgetMs = Math.Min((long)_o.OriginPermitTimeout.TotalMilliseconds, chunkDeadline - waitStart);
+            if (budgetMs <= 0) return null;
+
+            OriginBudget.Permit permit = null;
+            _stats.PermitWaitBegin();
+            try
+            {
+                permit = await OriginBudget.TryAcquireAsync(_originKey, _o.MaxOriginConnections,
+                                                            TimeSpan.FromMilliseconds(budgetMs), ct)
+                                           .ConfigureAwait(false);
+                return permit;
+            }
+            finally
+            {
+                // In the finally so a cancelled or timed-out wait still counts. Accumulating
+                // after the await instead was exactly backwards: the closing line reported
+                // permitWait=0.0s precisely when the budget was the culprit. The waiter COUNT is
+                // raised before the await for the same reason from the other side - a stream
+                // disposed with workers still queued writes its summary before they unwind, so
+                // the elapsed total alone can never see them.
+                long waited = Environment.TickCount64 - waitStart;
+                cursor.LastProgressTicks += waited;
+                _stats.PermitWaitEnd(waited);
+                if (waited >= LongPermitWaitMs)
+                {
+                    FetchLog.Write(_tag + " waited " +
+                                   (waited / 1000.0).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) +
+                                   "s for an origin permit (max-origin-connections=" + _o.MaxOriginConnections +
+                                   (permit == null ? ") and gave up" : ")"));
+                }
             }
         }
 
@@ -328,6 +439,7 @@ namespace EmbyStrmParallel
         private static bool IsRetryable(Exception ex)
         {
             if (ex is NotSupportedException) return false;                 // server ignored Range
+            if (ex is OriginBudgetTimeoutException) return false;          // our own limiter, wedged
             if (ex is OperationCanceledException) return true;             // our own phase timeout
             HttpRequestException hre = ex as HttpRequestException;
             if (hre != null)

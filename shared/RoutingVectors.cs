@@ -40,14 +40,22 @@ internal static class RoutingVectors
         return string.Join("\n", Lines());
     }
 
-    /// <summary>Every environment variable the parser reads, so a test can start from a clean slate.</summary>
+    /// <summary>
+    /// Every environment variable the parser reads, so a test can start from a clean slate.
+    ///
+    /// This is one of FOUR places that have to list a new setting - the others are
+    /// ParallelFetchOptions.FromConfiguration, StrmDirect.EnvNameFor and CheckConfig.EnvNameOf -
+    /// and it is the one that gets forgotten, because forgetting it breaks nothing until a
+    /// machine happens to export the variable. Count all four when adding a key.
+    /// </summary>
     internal static string[] EnvVars()
     {
         return new string[]
         {
             "EMBY_STRM_PREFIXES", "EMBY_STRM_CONFIG", "EMBY_STRM_RAMP_SECONDS",
             "EMBY_STRM_CONNECTIONS", "EMBY_STRM_CHUNK_MB", "EMBY_STRM_BUFFER_MB",
-            "EMBY_STRM_INITIAL_CONNECTIONS", "EMBY_STRM_LOG",
+            "EMBY_STRM_INITIAL_CONNECTIONS", "EMBY_STRM_MAX_ORIGIN_CONNECTIONS",
+            "EMBY_STRM_LOG",
         };
     }
 

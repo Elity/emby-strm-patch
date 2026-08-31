@@ -267,17 +267,46 @@ namespace EmbyStrmParallel.Tests
             }
         }
 
+        /// <summary>
+        /// Writes the body at <paramref name="bytesPerSec"/>, pacing BEFORE each write and in
+        /// blocks small enough for the pacing to be visible.
+        ///
+        /// Sleeping after a whole 256 KiB block instead was wrong in two ways that both hid real
+        /// behaviour. A body smaller than the block - every chunk in these tests is 64 KiB - was
+        /// written in a single burst and the handler then slept out the remainder, so
+        /// MockFault.Trickle delivered its bytes at full speed and never once reached the
+        /// throughput floor it exists to exercise; and the response stayed counted as concurrent
+        /// long after the client had finished reading it, which made a client that cycles
+        /// connections quickly appear to hold twice as many at the origin as it ever opened.
+        /// A real throttled origin dribbles for exactly as long as it is sending. So does this.
+        /// </summary>
         private async Task WriteRangeAsync(System.IO.Stream output, long from, long count, int bytesPerSec)
         {
-            const int Block = 256 * 1024;
-            byte[] buf = ArrayPool<byte>.Shared.Rent(Block);
+            int block = 256 * 1024;
+            if (bytesPerSec > 0)
+            {
+                // ~1/32 s of data per write: fine enough to pace a 64 KiB chunk over several
+                // writes, coarse enough not to drown the loop in Task.Delay calls.
+                block = bytesPerSec / 32;
+                if (block < 4096) block = 4096;
+                if (block > 256 * 1024) block = 256 * 1024;
+            }
+            byte[] buf = ArrayPool<byte>.Shared.Rent(block);
             try
             {
                 long done = 0;
                 long startTicks = Environment.TickCount64;
                 while (done < count)
                 {
-                    int n = (int)Math.Min(Block, count - done);
+                    int n = (int)Math.Min(block, count - done);
+
+                    if (bytesPerSec > 0)
+                    {
+                        long shouldStartMs = done * 1000L / bytesPerSec;
+                        long elapsed = Environment.TickCount64 - startTicks;
+                        if (shouldStartMs > elapsed) await Task.Delay((int)(shouldStartMs - elapsed), _cts.Token).ConfigureAwait(false);
+                    }
+
                     if (_fastContent)
                     {
                         long abs = from + done;
@@ -298,13 +327,6 @@ namespace EmbyStrmParallel.Tests
                     await output.WriteAsync(buf.AsMemory(0, n), _cts.Token).ConfigureAwait(false);
                     done += n;
                     Interlocked.Add(ref BytesServed, n);
-
-                    if (bytesPerSec > 0)
-                    {
-                        long shouldTakeMs = done * 1000L / bytesPerSec;
-                        long elapsed = Environment.TickCount64 - startTicks;
-                        if (shouldTakeMs > elapsed) await Task.Delay((int)(shouldTakeMs - elapsed), _cts.Token).ConfigureAwait(false);
-                    }
                 }
             }
             finally

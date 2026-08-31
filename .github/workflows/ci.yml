@@ -13,6 +13,9 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Several tests fail by never returning rather than by asserting, so a job-level bound is
+    # not theoretical. The harness caps each individual test as well.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -38,15 +41,16 @@ jobs:
         shell: bash
         run: bash parallel/run-tests.sh config
 
-  # The remaining fetcher tests assert on WALL-CLOCK behaviour, and two of them are slow on
-  # purpose: a trickling connection has to be given ~20 s to be abandoned and retried, and a
-  # genuinely slow consumer has to survive 11.7 s without tripping the throughput floor. Those
+  # The remaining fetcher tests assert on WALL-CLOCK behaviour: a genuinely slow consumer has to
+  # survive 11.7 s without tripping the throughput floor, and the origin-budget tests need
+  # several streams to overlap for seconds before they can measure anything. Those
   # are exactly the assertions that go red on a busy shared runner for reasons unrelated to the
   # code, so they run on one platform only. The fetcher itself is plain BCL code with no
   # platform-specific paths, so a single platform is honest coverage rather than a compromise.
   timing:
     name: timing-sensitive (ubuntu-latest)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4

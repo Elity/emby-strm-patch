@@ -19,16 +19,56 @@ namespace EmbyStrmParallel.Tests
 
         private static readonly List<Result> Results = new List<Result>();
 
+        /// <summary>
+        /// Ceiling on a single test. Generous - the slowest honest test here is ~20 s - because
+        /// its job is to turn a hang into a failure, not to police speed.
+        ///
+        /// Several of these tests fail by HANGING rather than by asserting: a budget that stops
+        /// being per-origin, a worker that dies without poisoning a channel, a permit that is
+        /// never returned. The elapsed-time assertion written to catch that is never reached,
+        /// nothing here had a timeout, and neither did the CI job - so the shape that matters
+        /// most would have run to GitHub's six-hour ceiling and reported nothing useful.
+        /// Live modes opt out: a soak or a sweep legitimately runs for minutes.
+        ///
+        /// It stops WAITING; it does not cancel. A hung test keeps its mock server and streams
+        /// alive in the background, so treat a timeout as "this run is no longer trustworthy",
+        /// not as a clean skip.
+        /// </summary>
+        internal static TimeSpan PerTestTimeout = TimeSpan.FromMinutes(2);
+
         internal static async Task RunAsync(string name, Func<Task<string>> body)
         {
             Console.Write("  " + name.PadRight(58));
             Stopwatch sw = Stopwatch.StartNew();
+            Task<string> run = null;
             try
             {
-                string detail = await body().ConfigureAwait(false);
+                // Task.Run, NOT body() directly. Several tests block the calling thread on
+                // purpose - ParallelFetch.Open() is synchronous by design, because the injected
+                // call site returns before any state machine starts - so body() may never get as
+                // far as returning a Task. Calling it inline meant the timeout below could not be
+                // reached at all on exactly the path it exists to guard: a mutant that made the
+                // permit wait unbounded hung the whole runner for 37 minutes with six tests
+                // passed, two never run and no summary printed.
+                run = Task.Run(body);
+                string detail = PerTestTimeout > TimeSpan.Zero
+                    ? await run.WaitAsync(PerTestTimeout).ConfigureAwait(false)
+                    : await run.ConfigureAwait(false);
                 sw.Stop();
                 Results.Add(new Result { Name = name, Ok = true, Detail = detail, Seconds = sw.Elapsed.TotalSeconds });
                 Console.WriteLine("PASS  " + sw.Elapsed.TotalSeconds.ToString("0.0") + "s  " + (detail ?? ""));
+            }
+            // Only OUR timeout - the body is still running. Without the filter this also swallowed
+            // a TimeoutException thrown by the test itself (a probe that gave up, or a test's own
+            // WaitAsync) and relabelled it "hung: no result after 120s" on a test that had in fact
+            // failed in 11 seconds.
+            catch (TimeoutException) when (run != null && !run.IsCompleted)
+            {
+                sw.Stop();
+                string msg = "hung: no result after " + PerTestTimeout.TotalSeconds.ToString("0") + "s";
+                Results.Add(new Result { Name = name, Ok = false, Detail = msg, Seconds = sw.Elapsed.TotalSeconds });
+                Console.WriteLine("FAIL  " + sw.Elapsed.TotalSeconds.ToString("0.0") + "s");
+                Console.WriteLine("        " + msg);
             }
             catch (Exception ex)
             {

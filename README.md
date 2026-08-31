@@ -146,7 +146,8 @@ Priority is **environment variable > file > built-in default**.
 | key | default | environment override | |
 |---|---|---|---|
 | `ramp-seconds` | 6 | `EMBY_STRM_RAMP_SECONDS` | seconds between adding connections |
-| `connections` | 8 | `EMBY_STRM_CONNECTIONS` | concurrent Range requests |
+| `connections` | 6 | `EMBY_STRM_CONNECTIONS` | concurrent Range requests, **per stream** |
+| `max-origin-connections` | 12 | `EMBY_STRM_MAX_ORIGIN_CONNECTIONS` | requests in flight against **one origin**, across every stream |
 | `chunk-mb` | 8 | `EMBY_STRM_CHUNK_MB` | bytes per Range request |
 | `buffer-mb` | 128 | `EMBY_STRM_BUFFER_MB` | reorder buffer ceiling |
 | `initial-connections` | 2 | `EMBY_STRM_INITIAL_CONNECTIONS` | connections opened immediately |
@@ -155,6 +156,17 @@ Priority is **environment variable > file > built-in default**.
 Settings only affect `parallel`. Keep tuning in **this file** rather than in exported environment
 variables: an Emby upgrade rewrites the launcher script where those exports live, and tuning that
 vanishes on upgrade resurfaces months later as "it started stuttering again".
+
+`connections` is per stream; `max-origin-connections` is what the origin actually sees, across
+every stream in the process. The two disagree exactly when it matters: abandoning a stream does
+not free its connections at the origin instantly, so for a second or two a seek puts the next
+stream's connections on top of the old ones. Tuning `connections` alone only works while you can
+assume how many streams overlap, and a burst of seeks or a second viewer breaks that assumption
+silently. Set the budget to what your origin tolerates and `connections` to what one stream should
+get; if the budget is lower, the fetcher lowers `connections` to match and says so on the stream's
+open line. A permit covers one Range request, not one stream, so an oversubscribed origin makes
+every stream slower rather than starving some of them — and when a budget is fully committed a new
+stream declines and Emby serves it over a single connection instead of queuing behind it.
 
 `ramp-seconds` is the one worth tuning per origin, and it has a **cliff** — one notch too low and
 sustained throughput collapses below the original problem. The shipped default of 6 is

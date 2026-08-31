@@ -148,6 +148,22 @@ true, and that assumption lived nowhere except in the number itself. Three viewe
 seeks, is 18 or 24 again. The budget puts the limit where the constraint actually is, so a single
 stream still runs flat out, several queue, and nothing crosses the cliff.
 
+**A permit covers ONE Range request — not one worker, and not one stream.** That distinction is
+the difference between throttling and rationing, and the first implementation got it wrong: a
+worker only exits when its whole stream is finished, so `max-origin-connections / connections`
+silently became the number of streams allowed to play at once. At 12 / 6 the third viewer's
+workers queued on a semaphore behind two streams that would not let go for two hours, its reader
+waited on a slot that was never filled, and playback froze with no error, no log line and no
+fallback. Request-scoped permits come back every few seconds, so an oversubscribed origin makes
+every stream slower — which is what throttling should feel like — instead of stopping some of them
+dead. Never take a permit for anything longer-lived than one attempt.
+
+**Declining is a deliberate outcome, not a failure.** The probe *is* chunk 0, so it takes a permit
+like any other request, but with a bound: `Open()` blocks a host request thread, so it cannot wait
+forever. If the origin's budget is fully committed the probe gives up, `TryOpen` returns null, and
+Emby serves that request over its own single connection — slower, correct, and written to the log.
+That is strictly better than queuing for a permit that may never arrive.
+
 **Do not guess — verify from the log.** A config edit is live within 30 s: play something, seek a
 few times, then read `slow=` and `rate=`.
 
@@ -387,7 +403,9 @@ Unlike the list above, these are real. They are recorded here so the next person
 does not have to re-derive the reasoning:
 
 - ~~Cross-stream connection budget~~ — **done**, see `parallel/src/OriginBudget.cs` and §3.3. A
-  semaphore grouped by authority, acquired and released per worker. What is shared is a count,
+  semaphore grouped by authority, acquired and released **per chunk request** (per-worker was the
+  first version: it turns the budget into "how many streams may play at once" and freezes the
+  rest — do not go back to it). What is shared is a count,
   never a connection pool; pools remain strictly per stream, for the reason recorded in
   `HttpClientHolder`.
   The related gap still open is a **cross-stream memory budget**: `FetchMetrics` is already a

@@ -2,7 +2,8 @@
 # EmbyStrmParallel test runner.
 #
 #   ./run-tests.sh              mock + config + live correctness + throughput  (~3 min)
-#   ./run-tests.sh mock         loopback correctness/faults/memory only, no network (~40 s)
+#   ./run-tests.sh mock         loopback correctness/faults/memory/budget, no network (~65 s)
+#   ./run-tests.sh budget       the origin-connection-budget subset of `mock` only (~25 s)
 #   ./run-tests.sh config       IsMatch configuration + self-arming log (instant)
 #   ./run-tests.sh logging      EMBY_STRM_LOG diagnostics only
 #   ./run-tests.sh live         live correctness + throughput
