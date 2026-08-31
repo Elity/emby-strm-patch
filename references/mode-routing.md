@@ -97,11 +97,48 @@ a case that barely occurs — an install normally has at most one origin that ne
 | key | default | environment override |
 |---|---|---|
 | `ramp-seconds` | 6 | `EMBY_STRM_RAMP_SECONDS` |
-| `connections` | 8 | `EMBY_STRM_CONNECTIONS` |
+| `connections` | 6 | `EMBY_STRM_CONNECTIONS` |
 | `chunk-mb` | 8 | `EMBY_STRM_CHUNK_MB` |
 | `buffer-mb` | 128 | `EMBY_STRM_BUFFER_MB` |
 | `initial-connections` | 2 | `EMBY_STRM_INITIAL_CONNECTIONS` |
 | `log` | off | `EMBY_STRM_LOG` |
+
+#### How to tune these
+
+**Turn `log` on first.** Without it you are tuning by feel, and feel cannot separate "the origin
+is slow" from "my connections are being throttled" from "it never finished ramping up". One line
+is written per stream at close, and it carries all three numbers you need:
+
+```
+#20 closed ABANDONED delivered=1365MiB/10749MiB elapsed=732.4s rate=15.64Mbps chunks=177/1346 retries=5 (slow=0)
+                                                              ~~~~~~~~~~~~~~~              ~~~~~~~
+```
+
+- **`rate=`** — what actually reached the player. Compare it against the source's bitrate
+  (`file bytes × 8 ÷ duration in seconds`). Below the bitrate it will stutter; you want headroom
+  above it, not parity.
+- **`slow=`** — connections abandoned for falling under the throughput floor. **Anything above
+  zero means you have opened too many** and the origin is throttling you. This is the only
+  reliable signal for tuning `connections`.
+- **`retries=`** — a handful is normal (expired signed URLs, the occasional 502). Steady growth
+  means the origin is unwell.
+
+Tune in this order, one setting at a time:
+
+1. **`connections`** — the one that matters. Lower it while `slow > 0`; raise it if `rate` is
+   below what the source needs *and* `slow` is still 0.
+   ⚠️ **It is a per-STREAM limit, while the origin limits the total it sees.** A seek makes two
+   streams overlap — the abandoned one's connections are not released at the origin
+   immediately — so the origin briefly sees roughly **twice** this number. Measured: 8 → ~16 at
+   the origin → collapse (every connection down to ~33 KB/s, 15 slow-retries, playback errored);
+   6 → ~12 → a 732 s continuous read at 15.64 Mbps with zero slow events.
+2. **`ramp-seconds`** — only if startup is slow; see the sweep in §7. **1 is a cliff**, do not
+   go looking.
+3. **`chunk-mb` / `buffer-mb`** — rarely worth touching. The memory ceiling is
+   `slots × chunk-mb`, and `slots ≤ connections + 4`.
+
+**Do not guess — verify from the log.** A config edit is live within 30 s: play something, seek a
+few times, then read `slow=` and `rate=`.
 
 **Priority: environment > file > built-in default.**
 

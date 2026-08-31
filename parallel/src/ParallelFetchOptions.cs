@@ -11,11 +11,10 @@ namespace EmbyStrmParallel
     ///   4 conn  = 14.67 Mbps      8 conn x  8 MiB = 24.2 / 31.6 Mbps
     ///   8 conn  = 32.05 Mbps     12 conn x  8 MiB = 42.5 Mbps
     ///                            16 conn x  8 MiB = persistent HTTP 503 (origin refuses)
-    /// 8 connections is deliberately below the 503 cliff, because a media server can have
-    /// several streams open at once. Chunk sizes between 2 and 16 MiB were not separable
-    /// above run-to-run variance, so 8 MiB was kept: it gives the best per-request duty cycle
-    /// (~16 s of transfer against a 0.6-4.0 s time-to-first-byte) and the fewest requests,
-    /// which matters because 403/503 responses are charged per request.
+    /// Chunk sizes between 2 and 16 MiB were not separable above run-to-run variance, so 8 MiB
+    /// was kept: it gives the best per-request duty cycle (~16 s of transfer against a 0.6-4.0 s
+    /// time-to-first-byte) and the fewest requests, which matters because 403/503 responses are
+    /// charged per request.
     ///
     /// On the reference deployment (a low-power NAS running Emby, egress through a transparent
     /// proxy), with ramp-seconds = 2: 96 MB ranges at 17.8 / 20.4 / 20.8 Mbps, 90-120 s
@@ -44,8 +43,31 @@ namespace EmbyStrmParallel
     /// </summary>
     public sealed class ParallelFetchOptions
     {
-        /// <summary>Number of concurrent HTTP Range requests.</summary>
-        public int Connections { get; set; } = 8;
+        /// <summary>
+        /// Number of concurrent HTTP Range requests **per stream**.
+        ///
+        /// The scope in that sentence is the whole point, and it is why the default is 6 rather
+        /// than the 8 the single-stream sweep above would suggest. The origin's limit is on the
+        /// connections IT sees, across everything; this setting is per stream. Seeking makes
+        /// those two disagree: abandoning a stream does not free its connections at the origin
+        /// instantly, so for a second or two the next stream's connections are added on top.
+        ///
+        /// Measured on the live host, same file, minutes apart:
+        ///   Connections = 8  ->  two streams overlap at a seek  ->  ~16 at the origin
+        ///                        every connection collapses to ~33 KB/s, 15 slow-retries,
+        ///                        one stream managed 0.14 Mbps and playback errored out
+        ///   Connections = 6  ->  ~12 at the origin, which the sweep shows is still healthy
+        ///                        732 s continuous read at 15.64 Mbps, 19.82 Mbps on another,
+        ///                        ZERO slow-connection events across the whole session
+        ///   Connections = 4  ->  safe, but only 6-10 Mbps delivered, which is not enough for
+        ///                        a high-bitrate source (an 18.3 GB film needs ~20 Mbps)
+        ///
+        /// So 6 is not "the fastest setting"; it is the largest one that still leaves room for
+        /// the second stream a seek creates. That reasoning only holds for TWO overlapping
+        /// streams — three viewers, or a burst of seeks, can still cross the cliff. The real fix
+        /// is a process-wide budget rather than a per-stream number; see references/mode-routing.md 11.1.
+        /// </summary>
+        public int Connections { get; set; } = 6;
 
         /// <summary>
         /// Connections opened immediately; the rest join one per ConnectionRampInterval.
