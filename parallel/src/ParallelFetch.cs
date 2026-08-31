@@ -72,6 +72,13 @@ namespace EmbyStrmParallel
             }
             catch (Exception ex)
             {
+                // Two things must NOT become a fallback. A cancelled request is the host tearing
+                // down, so retrying it on the original path would start a second fetch for a
+                // client that has already gone; and a process-level failure is not the origin's
+                // fault, so hiding it makes a sick host look merely slow.
+                if (cancellationToken.IsCancellationRequested) throw;
+                if (HttpRangeHelper.IsFatalToProcess(ex)) throw;
+
                 totalLength = null;
                 contentLength = null;
                 FetchLog.Write("FALLBACK to host path: url=" + FetchLog.Tail(url) +
@@ -116,7 +123,7 @@ namespace EmbyStrmParallel
 
             // The probe IS chunk 0. The origin costs ~1.7s to first byte (302 -> signed CDN url),
             // so a separate HEAD/size probe would double time-to-first-byte for no benefit.
-            long probeSpan = length > 0 ? Math.Min(length, o.FirstChunkSize) : o.FirstChunkSize;
+            long probeSpan = ChunkSchedule.ProbeSpan(length, o.FirstChunkSize);
             long probeEnd = offset + probeSpan - 1;
 
             HttpResponseMessage response = SendProbe(client, url, offset, probeEnd, o, cancellationToken);
@@ -127,6 +134,8 @@ namespace EmbyStrmParallel
                 {
                     throw new IOException("Origin rejected range " + offset + "-" + probeEnd + " (416).");
                 }
+
+                HttpRangeHelper.EnsureIdentityEncoding(response);
 
                 if (response.StatusCode == HttpStatusCode.OK)
                 {
@@ -143,7 +152,7 @@ namespace EmbyStrmParallel
                     clientHandedOff = true;
                     FetchLog.Write("open path=single-conn-fallback (origin ignored Range) url=" + FetchLog.Tail(url) +
                                    " offset=" + offset + " length=" + eff0 + " total=" + full);
-                    return new SkipLimitStream(response, body0, client, offset, eff0);
+                    return new SkipLimitStream(response, body0, client, offset, eff0, o.ReadIdleTimeout);
                 }
 
                 if (response.StatusCode != HttpStatusCode.PartialContent)
@@ -151,56 +160,52 @@ namespace EmbyStrmParallel
                     throw new HttpRequestException("Probe returned " + (int)response.StatusCode + ".", null, response.StatusCode);
                 }
 
+                // Everything below depends on knowing where these bytes belong. A 206 whose
+                // Content-Range is missing, unparseable or "bytes */N" tells us nothing, and the
+                // old code carried on regardless: a proxy answering a 1 MiB-offset request with a
+                // header-less 206 whose body started at zero produced the right byte COUNT at the
+                // wrong POSITION, with no error anywhere. Refusing hands the request back to
+                // Emby's own single-connection path, which is slower and correct.
                 long from, to, total;
-                bool haveContentRange = HttpRangeHelper.TryGetContentRange(response, out from, out to, out total);
-                if (haveContentRange && from >= 0 && from != offset)
+                ContentRangeStatus status = HttpRangeHelper.ParseContentRange(response, out from, out to, out total);
+                if (status != ContentRangeStatus.Valid)
+                {
+                    throw new IOException("Origin answered 206 with " + HttpRangeHelper.Describe(status) +
+                                          "; cannot establish where the body belongs.");
+                }
+                if (from != offset)
                 {
                     throw new IOException("Content-Range start " + from + " does not match requested " + offset + ".");
                 }
-
-                // RFC 7233: complete-length must exceed last-byte-pos. A proxy or cache that
-                // fills in the size of a *different* object produces e.g. "bytes 50000-149999/0".
-                // Trusting that total would clamp the delivery to nothing and hand the host a
-                // clean, successful, EMPTY 206 - silent data loss with no error anywhere. Treat
-                // it as an unusable total instead.
-                if (haveContentRange && total >= 0)
+                if (to > probeEnd)
                 {
-                    long lastByte = to >= 0 ? to : offset;
-                    if (total <= lastByte)
-                    {
-                        throw new IOException("Origin returned a self-contradictory Content-Range: total " + total +
-                                              " does not exceed last-byte-pos " + lastByte +
-                                              " (RFC 7233 requires complete-length > last-byte-pos).");
-                    }
+                    throw new IOException("Content-Range end " + to + " exceeds requested " + probeEnd + ".");
                 }
 
-                long effective;
-                if (!haveContentRange || total < 0)
+                // No numeric complete-length means no fallback either: the host writes this
+                // straight into the outgoing Content-Range denominator, and when TotalLength is
+                // null it substitutes Stream.Length - which is this range's size, not the file's.
+                // Confirmed against stock 4.9.3.0 FileWriter.SetContentResponseHeaders:
+                //     TotalContentLength = handler.TotalLength ?? handler.Stream?.Length
+                // Returning a range length there corrupts the response header and can clamp the
+                // copy. There is nothing to salvage; decline and let Emby serve it.
+                if (total < 0)
                 {
-                    // No usable "/total". Never invent one: the host puts this straight into the
-                    // Content-Range response header. A bounded range can still be served exactly;
-                    // an open-ended one cannot, because we do not know where the resource ends.
-                    if (length <= 0)
-                    {
-                        throw new IOException("Origin returned 206 without a Content-Range total; cannot locate end of resource.");
-                    }
-                    effective = length;
-                    totalLength = null;
-                    contentLength = effective;
+                    throw new IOException("Origin answered 206 with an unknown complete-length (\"/*\"); " +
+                                          "the host requires a total to build Content-Range.");
                 }
-                else
+
+                long available = total - offset;
+                if (available <= 0)
                 {
-                    long available = total - offset;
-                    if (available <= 0)
-                    {
-                        // Unreachable given the RFC check above; refuse rather than return empty.
-                        throw new IOException("Origin reported total " + total + " at or below the requested offset " +
-                                              offset + " while answering 206.");
-                    }
-                    effective = length > 0 ? Math.Min(length, available) : available;
-                    totalLength = total;
-                    contentLength = effective;
+                    // Unreachable: the parser already rejects total <= last-byte-pos, and
+                    // last-byte-pos >= offset. Refuse rather than return empty.
+                    throw new IOException("Origin reported total " + total + " at or below the requested offset " +
+                                          offset + " while answering 206.");
                 }
+                long effective = length > 0 ? Math.Min(length, available) : available;
+                totalLength = total;
+                contentLength = effective;
 
                 if (effective == 0)
                 {
@@ -209,7 +214,7 @@ namespace EmbyStrmParallel
                 }
 
                 ParallelRangeStream stream = new ParallelRangeStream(
-                    client, url, offset, effective, o, response, cancellationToken);
+                    client, url, offset, effective, total, o, response, cancellationToken);
                 handedOff = true;
                 clientHandedOff = true;
 
@@ -218,7 +223,7 @@ namespace EmbyStrmParallel
                     FetchLog.Write("open path=parallel #" + stream.StreamId +
                         " url=" + FetchLog.Tail(url) +
                         " offset=" + offset + " length=" + effective +
-                        " total=" + (totalLength.HasValue ? totalLength.Value.ToString(CultureInfo.InvariantCulture) : "unknown") +
+                        " total=" + total.ToString(CultureInfo.InvariantCulture) +
                         " conn=" + o.Connections +
                         " chunk=" + FetchLog.Size(o.ChunkSize) +
                         " firstChunk=" + FetchLog.Size(o.FirstChunkSize) +
@@ -257,6 +262,7 @@ namespace EmbyStrmParallel
             while (true)
             {
                 bool timedOut = false;
+                long retryAfterMs = -1;
                 long remainingMs = deadline - Environment.TickCount64;
                 if (remainingMs <= 0)
                 {
@@ -273,6 +279,10 @@ namespace EmbyStrmParallel
                         probe.CancelAfter(TimeSpan.FromMilliseconds(headerMs));
                         HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Get, url);
                         req.Headers.Range = new RangeHeaderValue(from, toInclusive);
+                        // Pin the representation. Absent this a server is free to answer with an
+                        // encoding we never asked for, and byte offsets into a re-encoded body
+                        // point at the wrong media bytes.
+                        req.Headers.AcceptEncoding.Add(new StringWithQualityHeaderValue("identity"));
                         req.Version = HttpVersion.Version11;
                         req.VersionPolicy = HttpVersionPolicy.RequestVersionOrLower;
                         response = await client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, probe.Token)
@@ -294,6 +304,7 @@ namespace EmbyStrmParallel
                     if (!HttpRangeHelper.IsTransientStatus(response.StatusCode)) return response;
 
                     HttpStatusCode transient = response.StatusCode;
+                    retryAfterMs = HttpRangeHelper.RetryAfterMs(response);
                     try { response.Dispose(); } catch { }
                     throw new HttpRequestException("Probe returned " + (int)transient + ".", null, transient);
                 }
@@ -313,7 +324,8 @@ namespace EmbyStrmParallel
                     attempt++;
                     Log("probe retry " + attempt + "/" + (o.MaxAttempts - 1) + " url=" + FetchLog.Tail(url) +
                         " range=" + from + "-" + toInclusive + " after " + FetchLog.Describe(ex));
-                    long delay = Math.Min((long)o.RetryBaseDelayMs << Math.Min(attempt - 1, 20), o.RetryMaxDelayMs);
+                    long backoff = Math.Min((long)o.RetryBaseDelayMs << Math.Min(attempt - 1, 20), o.RetryMaxDelayMs);
+                    long delay = HttpRangeHelper.RetryDelayMs((int)backoff, retryAfterMs);
                     long left = deadline - Environment.TickCount64;
                     if (left <= 0) throw;
                     if (delay > left) delay = left;

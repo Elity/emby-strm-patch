@@ -230,6 +230,31 @@ sweep exists so it can be made on evidence.
 5. Somebody actually watches a video. Throughput numbers and byte counts do not measure
    "does it stutter", and the two have disagreed before.
 
+Step 1 patches the fixtures **with `--parallel`**, and the behaviour test then invokes the
+injected `GetContent` through reflection. Before that, patch C's IL had never been executed by
+any test: the helper's own suite was entirely green while saying nothing about whether Emby ever
+calls it, whether the null-means-fallback branch is wired the right way round, or whether
+`TotalLength` and `Length` land on the properties the host reads. **A direct helper test and an
+injection test do not cover each other.**
+
+### 8.1 Failure modes that now have a test
+
+Every row below is a defect the layers downstream cannot see — either the right byte *count* at
+the wrong byte *position*, or a hang. Each has a case that genuinely fails without the fix:
+
+| Failure mode | Consequence | Where |
+|---|---|---|
+| 206 with a missing, unparseable or `bytes */N` Content-Range | body spliced in at an offset it did not come from; the length still adds up | `run-tests.sh mock` |
+| complete-length changes mid-transfer | two versions of the object stitched into one file | same |
+| 206 that reports only `/*` | host publishes this stream's *range* length as the *file* length | same + behaviour §7 |
+| response carries a non-identity `Content-Encoding` | byte offsets into a re-encoded representation | `run-tests.sh mock` |
+| a worker throws outside a chunk download | reader waits forever: no error, no fallback, playback just freezes | same |
+| 503 with `Retry-After` ignored | retrying before the server said to, reconverging into the herd that caused it | same |
+
+There is only one way to know a new case is worth having: **remove the fix and check that it goes
+red.** All six were verified that way. Before the fix, the Content-Range case accepted 5 of 8
+malformed headers and delivered bytes from the wrong position for every one of them.
+
 ## 9. Prefixes are matched against the **percent-encoded** URL
 
 A `.strm` file stores a URL, and Emby puts that string into `MediaSourceInfo.Path` **verbatim** —
@@ -259,3 +284,26 @@ close to impossible to diagnose from symptoms alone.
 - runtime self-healing when a prefix says `parallel` but patch C is absent (§5)
 - a compatibility fallback to the previous configuration filename (§3.1)
 - a per-prefix switch for patch A (§4)
+
+### 11.1 Known gaps, deliberately left open
+
+Unlike the list above, these are real. They are recorded here so the next person to find them
+does not have to re-derive the reasoning:
+
+- **Cross-stream connection and memory budgets.** One connection pool per stream is a measured,
+  deliberate choice: a shared pool let an abandoned stream poison the next one
+  (25.14 → 2.58 → 0.57 → 0.15 Mbps, while curl on fresh connections was healthy at the same
+  instant). So any global budget **must not reintroduce a shared pool**. `FetchMetrics` is
+  already a process-wide buffered-byte counter; what is missing is admission control, not
+  observability. Two default streams add up to 16 connections, which is past the 503 cliff
+  measured on the reference origin — though that specific collision has not been demonstrated
+  with a two-stream experiment.
+- **The probe blocks a host request thread** for up to the stall budget (30s). This follows from
+  the injection point: patch C returns `Task.FromResult` before the async state machine starts,
+  so making the probe asynchronous means injecting a continuation. Not a small change.
+- **Emby's `StaticFileResultOptions.RequestHeaders` are not forwarded** to the origin. Signed
+  URLs carry their own authorisation, and an origin that needs more answers 401/403 → retry →
+  fallback, which is a *loud* failure rather than a silent one.
+- **No strong validator (`If-Range` / `ETag`).** Comparing complete-length catches every version
+  change that alters the size, but not a same-length replacement. The reference origin does not
+  supply a strong validator, so there is nothing to send.

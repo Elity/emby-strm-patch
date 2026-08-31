@@ -12,6 +12,7 @@ namespace EmbyStrmParallel.Tests
         None = 0,
         Status403,
         Status500,
+        Status503RetryAfter,   // 503 carrying the server's own Retry-After instruction
         TruncateHalf,   // announce the full length, send half, reset the connection
         Trickle,        // technically succeeds, but far too slow to be usable
         IgnoreRange     // answer 200 with the whole resource
@@ -75,6 +76,35 @@ namespace EmbyStrmParallel.Tests
 
         /// <summary>(from, toInclusive) -> the total to advertise in Content-Range. Null = the truth.</summary>
         internal Func<long, long, long> ContentRangeTotal;
+
+        /// <summary>
+        /// (from, toInclusive) -> the literal Content-Range header value, or null to send a 206
+        /// with NO Content-Range at all. Takes precedence over ContentRangeTotal.
+        /// Lets a test reproduce the header shapes a broken proxy emits: absent, unparseable,
+        /// "bytes */N", or an unknown complete-length.
+        /// </summary>
+        internal Func<long, long, string> ContentRangeHeader;
+
+        /// <summary>
+        /// (from, toInclusive) -> the offset the body is actually generated from. Default: the
+        /// truth. A proxy that answers a mid-file request with the start of the file produces
+        /// the right byte COUNT at the wrong POSITION, which no length check can catch.
+        /// </summary>
+        internal Func<long, long, long> BodyOffset;
+
+        /// <summary>Non-null = advertise this Content-Encoding (body is still identity; only the claim matters).</summary>
+        internal string ContentEncoding;
+
+        /// <summary>Non-null = send this Retry-After value alongside a 503, and record the wait between attempts.</summary>
+        internal string RetryAfter;
+
+        /// <summary>TickCount64 of every request, so a test can assert how long the client waited.</summary>
+        internal readonly System.Collections.Concurrent.ConcurrentQueue<long> RequestTicks =
+            new System.Collections.Concurrent.ConcurrentQueue<long>();
+
+        /// <summary>Accept-Encoding of every request, so a test can prove the representation was pinned.</summary>
+        internal readonly System.Collections.Concurrent.ConcurrentQueue<string> AcceptEncodings =
+            new System.Collections.Concurrent.ConcurrentQueue<string>();
 
         /// <summary>Responses currently being written. Mirrors what an origin would see as open connections.</summary>
         internal int ActiveResponses { get { return Volatile.Read(ref _concurrent); } }
@@ -147,6 +177,8 @@ namespace EmbyStrmParallel.Tests
                 }
 
                 int seq = Interlocked.Increment(ref RequestCount);
+                RequestTicks.Enqueue(Environment.TickCount64);
+                AcceptEncodings.Enqueue(ctx.Request.Headers["Accept-Encoding"] ?? "");
                 try
                 {
                     IPEndPoint rep = ctx.Request.RemoteEndPoint;
@@ -164,6 +196,14 @@ namespace EmbyStrmParallel.Tests
 
                 if (fault == MockFault.Status403) { ctx.Response.StatusCode = 403; ctx.Response.Close(); return; }
                 if (fault == MockFault.Status500) { ctx.Response.StatusCode = 500; ctx.Response.Close(); return; }
+                if (fault == MockFault.Status503RetryAfter)
+                {
+                    ctx.Response.StatusCode = 503;
+                    string ra = RetryAfter;
+                    if (ra != null) ctx.Response.Headers["Retry-After"] = ra;
+                    ctx.Response.Close();
+                    return;
+                }
 
                 if (fault == MockFault.IgnoreRange || !hasRange)
                 {
@@ -174,19 +214,36 @@ namespace EmbyStrmParallel.Tests
                 else
                 {
                     ctx.Response.StatusCode = 206;
-                    long advertised = Size;
-                    Func<long, long, long> crt = ContentRangeTotal;
-                    if (crt != null) advertised = crt(from, to);
-                    ctx.Response.Headers["Content-Range"] = "bytes " + from + "-" + to + "/" + advertised;
+                    Func<long, long, string> crh = ContentRangeHeader;
+                    if (crh != null)
+                    {
+                        // null from the hook => a 206 with no Content-Range header at all
+                        string header = crh(from, to);
+                        if (header != null) ctx.Response.Headers["Content-Range"] = header;
+                    }
+                    else
+                    {
+                        long advertised = Size;
+                        Func<long, long, long> crt = ContentRangeTotal;
+                        if (crt != null) advertised = crt(from, to);
+                        ctx.Response.Headers["Content-Range"] = "bytes " + from + "-" + to + "/" + advertised;
+                    }
                 }
 
+                string ce = ContentEncoding;
+                if (ce != null) ctx.Response.Headers["Content-Encoding"] = ce;
+
                 long len = to - from + 1;
+                long bodyFrom = from;
+                Func<long, long, long> bo = BodyOffset;
+                if (bo != null) bodyFrom = bo(from, to);
+
                 ctx.Response.ContentType = "application/octet-stream";
                 ctx.Response.ContentLength64 = len;
 
                 long send = fault == MockFault.TruncateHalf ? len / 2 : len;
                 int rate = fault == MockFault.Trickle ? TrickleBytesPerSec : ThrottleBytesPerSec;
-                await WriteRangeAsync(ctx.Response.OutputStream, from, send, rate).ConfigureAwait(false);
+                await WriteRangeAsync(ctx.Response.OutputStream, bodyFrom, send, rate).ConfigureAwait(false);
 
                 if (fault == MockFault.TruncateHalf) { ctx.Response.Abort(); return; }
                 ctx.Response.Close();
@@ -275,6 +332,8 @@ namespace EmbyStrmParallel.Tests
             Interlocked.Exchange(ref BytesServed, 0);
             Interlocked.Exchange(ref MaxConcurrent, 0);
             RemotePorts.Clear();
+            RequestTicks.Clear();
+            AcceptEncodings.Clear();
         }
 
         public void Dispose()

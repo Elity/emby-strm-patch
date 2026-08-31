@@ -173,11 +173,15 @@ namespace EmbyStrmParallel
             o.BlockSize = Clamp(o.BlockSize, 4 * 1024, 1024 * 1024);
             o.ChunkSize = Clamp(o.ChunkSize, o.BlockSize, 256 * 1024 * 1024);
             o.FirstChunkSize = Clamp(o.FirstChunkSize, o.BlockSize, o.ChunkSize);
-            o.Connections = Clamp(o.Connections, 1, 64);
+            o.Connections = Clamp(o.Connections, 1, MaxConnections);
             o.MaxAttempts = Clamp(o.MaxAttempts, 1, 16);
             o.RetryBaseDelayMs = Clamp(o.RetryBaseDelayMs, 0, 10000);
             o.RetryMaxDelayMs = Clamp(o.RetryMaxDelayMs, o.RetryBaseDelayMs, 60000);
             if (o.MaxBufferBytes < o.ChunkSize) o.MaxBufferBytes = o.ChunkSize;
+            // Also bound from above, for options built in code rather than read from the file:
+            // Slots is capped at Connections + 4, so an unbounded buffer would still allow
+            // 68 x 256 MiB = 17 GiB of read-ahead in a process that also has to serve video.
+            if (o.MaxBufferBytes > MaxBufferMiB * 1024 * 1024) o.MaxBufferBytes = MaxBufferMiB * 1024 * 1024;
 
             // Slots = the reorder window. Memory ceiling == Slots * ChunkSize.
             long slots = o.MaxBufferBytes / o.ChunkSize;
@@ -192,6 +196,10 @@ namespace EmbyStrmParallel
             // 0 or >= Connections means "no ramp": every worker starts immediately.
             if (o.InitialConnections <= 0 || o.InitialConnections > o.Connections) o.InitialConnections = o.Connections;
             if (o.ConnectionRampInterval < TimeSpan.Zero) o.ConnectionRampInterval = TimeSpan.FromSeconds(4);
+            // The ramp delay is multiplied by the worker's position, and Task.Delay rejects
+            // anything past ~49 days. Bounding it here keeps that arithmetic in range.
+            if (o.ConnectionRampInterval > TimeSpan.FromSeconds(MaxRampSeconds))
+                o.ConnectionRampInterval = TimeSpan.FromSeconds(MaxRampSeconds);
 
             o.BlocksPerChunk = (o.ChunkSize + o.BlockSize - 1) / o.BlockSize;
             if (o.BlocksPerChunk < 1) o.BlocksPerChunk = 1;
@@ -233,12 +241,17 @@ namespace EmbyStrmParallel
             ParallelFetchOptions o = new ParallelFetchOptions();
             try
             {
-                int n;
-                if (TrySetting("connections", out n)) o.Connections = n;
-                if (TrySetting("chunk-mb", out n)) o.ChunkSize = n * 1024 * 1024;
-                if (TrySetting("buffer-mb", out n)) o.MaxBufferBytes = (long)n * 1024 * 1024;
-                if (TrySetting("initial-connections", out n)) o.InitialConnections = n;
-                if (TrySetting("ramp-seconds", out n)) o.ConnectionRampInterval = TimeSpan.FromSeconds(n);
+                long n;
+                // Every value is bounded BEFORE it is scaled or narrowed. `chunk-mb = 2048` used
+                // to overflow int during `n * 1024 * 1024`, land on int.MinValue, and then get
+                // clamped by Normalize() into 64 KiB chunks - the opposite of what was asked
+                // for, applied silently. A tuning knob that quietly means something else is
+                // worse than one that is ignored, because the numbers still look plausible.
+                if (TrySetting("connections", out n)) o.Connections = (int)Math.Min(n, MaxConnections);
+                if (TrySetting("chunk-mb", out n)) o.ChunkSize = (int)(Math.Min(n, MaxChunkMiB) * 1024 * 1024);
+                if (TrySetting("buffer-mb", out n)) o.MaxBufferBytes = Math.Min(n, MaxBufferMiB) * 1024 * 1024;
+                if (TrySetting("initial-connections", out n)) o.InitialConnections = (int)Math.Min(n, MaxConnections);
+                if (TrySetting("ramp-seconds", out n)) o.ConnectionRampInterval = TimeSpan.FromSeconds(Math.Min(n, MaxRampSeconds));
             }
             catch
             {
@@ -247,12 +260,17 @@ namespace EmbyStrmParallel
             return o;
         }
 
-        private static bool TrySetting(string key, out int value)
+        private const int MaxConnections = 64;
+        private const long MaxChunkMiB = 256;
+        private const long MaxBufferMiB = 2048;
+        private const long MaxRampSeconds = 600;
+
+        private static bool TrySetting(string key, out long value)
         {
             value = 0;
             string raw = StrmDirect.GetSetting(key);
             if (string.IsNullOrWhiteSpace(raw)) return false;
-            return int.TryParse(raw.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out value) && value > 0;
+            return long.TryParse(raw.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out value) && value > 0;
         }
     }
 }

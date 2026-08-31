@@ -17,17 +17,47 @@ namespace EmbyStrmParallel
         private readonly HttpResponseMessage _response;
         private readonly Stream _inner;
         private readonly HttpClient _client;
+        private readonly TimeSpan _readIdleTimeout;
         private long _toSkip;
         private long _remaining;
         private int _disposed;
 
-        internal SkipLimitStream(HttpResponseMessage response, Stream inner, HttpClient client, long skip, long limit)
+        internal SkipLimitStream(HttpResponseMessage response, Stream inner, HttpClient client,
+                                 long skip, long limit, TimeSpan readIdleTimeout)
         {
             _response = response;
             _inner = inner;
             _client = client;
+            _readIdleTimeout = readIdleTimeout;
             _toSkip = skip;
             _remaining = limit;
+        }
+
+        /// <summary>
+        /// One network read with a deadline on the read itself.
+        ///
+        /// Without this the only thing that could ever end a dead body was the caller's token:
+        /// an origin that sent headers and then nothing held a request thread, a socket and the
+        /// client's player indefinitely. The timer covers the underlying read only, so a
+        /// consumer that stops asking is never mistaken for a stalled origin - it simply is not
+        /// inside this method.
+        /// </summary>
+        private async ValueTask<int> ReadInnerAsync(Memory<byte> dst, CancellationToken ct)
+        {
+            using (CancellationTokenSource idle = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            {
+                if (_readIdleTimeout > TimeSpan.Zero) idle.CancelAfter(_readIdleTimeout);
+                try
+                {
+                    return await _inner.ReadAsync(dst, idle.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    throw new IOException("Origin sent no data for " +
+                        _readIdleTimeout.TotalSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                        "s on the single-connection path.");
+                }
+            }
         }
 
         public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken)
@@ -38,7 +68,7 @@ namespace EmbyStrmParallel
                 byte[] scratch = ArrayPool<byte>.Shared.Rent(want);
                 try
                 {
-                    int n = await _inner.ReadAsync(scratch.AsMemory(0, want), cancellationToken).ConfigureAwait(false);
+                    int n = await ReadInnerAsync(scratch.AsMemory(0, want), cancellationToken).ConfigureAwait(false);
                     if (n <= 0) throw new IOException("Stream ended while skipping to the requested offset.");
                     _toSkip -= n;
                 }
@@ -50,7 +80,7 @@ namespace EmbyStrmParallel
 
             if (_remaining <= 0 || buffer.Length == 0) return 0;
             int take = (int)Math.Min((long)buffer.Length, _remaining);
-            int read = await _inner.ReadAsync(buffer.Slice(0, take), cancellationToken).ConfigureAwait(false);
+            int read = await ReadInnerAsync(buffer.Slice(0, take), cancellationToken).ConfigureAwait(false);
             if (read <= 0) throw new IOException("Stream ended " + _remaining + " bytes short of the requested range.");
             _remaining -= read;
             return read;

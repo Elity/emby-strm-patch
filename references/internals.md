@@ -174,6 +174,36 @@ Two things make this different from A and B:
 the failure path for anything the helper cannot handle, and it degrades to ordinary Emby
 behaviour rather than to an error.
 
+#### `TotalLength` falls back to `Stream.Length`
+
+`FileWriter.SetContentResponseHeaders` does not simply read `TotalLength`. Disassembled from a
+stock 4.9.3.0 assembly:
+
+```
+IL_013a  callvirt  StreamHandler::get_TotalLength()
+IL_0143  Nullable`1<int64>::get_HasValue()
+IL_0148  brtrue    IL_016d          ← has a value: use it
+IL_014c  callvirt  StreamHandler::get_Stream()
+IL_0161  callvirt  Stream::get_Length()   ← otherwise fall back to Stream.Length
+IL_016f  call      FileWriter::set_TotalContentLength(...)
+```
+
+`TotalContentLength` is the Content-Range denominator and it clamps the copy. A parallel stream's
+`Length` is the size of the **requested range**, not of the resource, so publishing it there is
+wrong for every non-zero offset — and wrong in the worst way, since the byte count still adds up.
+
+Two defences, both required:
+
+1. If the probe cannot obtain a numeric complete-length, `TryOpen` returns `null` and the request
+   goes back to Emby's own path.
+2. `ParallelRangeStream.Length` throws `NotSupportedException`.
+
+The second is not redundant. The whole expression above sits inside a
+`try { } catch (NotSupportedException) { }`, so **throwing is safer than returning a
+plausible-looking wrong number**: the exception leaves `TotalContentLength` unset, whereas a
+number is believed and published. `SkipLimitStream` always threw; only the parallel stream ever
+returned a value.
+
 ### B and C in one assembly
 
 They are injected into **different methods of the same type**, with independent marker fields, so

@@ -77,11 +77,18 @@ namespace EmbyStrmParallel
             if (length < 0) length = 0;
         }
 
-        /// <summary>Length of chunk 0 - the span the opening probe request must ask for.</summary>
-        internal static long FirstChunkLength(long totalToRead, int firstChunkSize, int chunkSize)
+        /// <summary>
+        /// Span the opening probe must request. It runs before the resource total is known, so
+        /// it is bounded only by the caller's requested length; when that is 0 (open-ended) the
+        /// probe asks for a full first chunk and the schedule clamps chunk 0 afterwards.
+        ///
+        /// This lives here rather than in ParallelFetch because it is the same rule as chunk 0's
+        /// size, and the two drifting apart would put the probe body and chunk 0's range on
+        /// different byte spans.
+        /// </summary>
+        internal static long ProbeSpan(long boundedLength, int firstChunkSize)
         {
-            long first = firstChunkSize < chunkSize ? firstChunkSize : chunkSize;
-            return totalToRead > 0 && totalToRead < first ? totalToRead : first;
+            return boundedLength > 0 && boundedLength < firstChunkSize ? boundedLength : firstChunkSize;
         }
     }
 }

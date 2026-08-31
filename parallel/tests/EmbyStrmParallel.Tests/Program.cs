@@ -43,6 +43,18 @@ namespace EmbyStrmParallel.Tests
                     {
                         Console.WriteLine();
                         Console.WriteLine("!! live tests skipped: " + reason);
+
+                        // "all" is a mixed run: skipping the live half there is normal and the
+                        // offline half still means something. But a mode that asks for nothing
+                        // BUT live tests and then runs none of them has not passed - it has not
+                        // run. Exiting 0 there let a release gate read "TOTAL 0 PASS 0 FAIL 0"
+                        // as a green light.
+                        if (mode != "all")
+                        {
+                            Console.WriteLine("   " + mode + " is a live-only mode, so this is a failure, not a skip.");
+                            Console.WriteLine("   Put the origin url in TEST_URL.txt or set EMBY_STRM_TEST_URL.");
+                            return 2;
+                        }
                     }
                     else
                     {

@@ -216,14 +216,17 @@ namespace EmbyStrmParallel.Tests
                         Harness.Assert(s.CanRead, "CanRead should be true");
                         Harness.Assert(!s.CanSeek, "CanSeek must be false");
                         Harness.Assert(!s.CanWrite, "CanWrite must be false");
-                        Harness.AssertEqual(200000, s.Length, "Length");
-                        bool seekThrew = false, posThrew = false, writeThrew = false;
+                        bool seekThrew = false, posThrew = false, writeThrew = false, lenThrew = false;
+                        try { long _ = s.Length; } catch (NotSupportedException) { lenThrew = true; }
                         try { s.Seek(0, SeekOrigin.Begin); } catch (NotSupportedException) { seekThrew = true; }
                         try { s.Position = 5; } catch (NotSupportedException) { posThrew = true; }
                         try { s.Write(new byte[1], 0, 1); } catch (NotSupportedException) { writeThrew = true; }
                         Harness.Assert(seekThrew, "Seek should throw NotSupportedException");
                         Harness.Assert(posThrew, "Position setter should throw NotSupportedException");
                         Harness.Assert(writeThrew, "Write should throw NotSupportedException");
+                        // Length is the RANGE size, not the resource size, and the host reads it
+                        // as the latter when TotalLength is null. Refusing is the safe answer.
+                        Harness.Assert(lenThrew, "Length should throw NotSupportedException");
                         await Task.CompletedTask;
                     }
                     return "forward-only enforced";
@@ -417,6 +420,13 @@ namespace EmbyStrmParallel.Tests
                 }).ConfigureAwait(false);
             }
 
+            Harness.Section("mock server: response headers that would misplace bytes");
+
+            await UntrustworthyContentRangeAsync(ct).ConfigureAwait(false);
+            await UnknownTotalAsync(ct).ConfigureAwait(false);
+            await ContentEncodingAsync(ct).ConfigureAwait(false);
+            await RetryAfterAsync(ct).ConfigureAwait(false);
+
             Harness.Section("mock server: backpressure, memory, cancellation");
 
             await ContradictoryContentRangeAsync(ct).ConfigureAwait(false);
@@ -427,6 +437,294 @@ namespace EmbyStrmParallel.Tests
             await MemoryCeilingAsync(ct).ConfigureAwait(false);
             await CancellationAsync(ct).ConfigureAwait(false);
             await DisposeMidStreamAsync(ct).ConfigureAwait(false);
+            await WorkerStartupFailureAsync(ct).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// The worst failure this component can have: right byte COUNT, wrong byte POSITION.
+        /// Nothing downstream can see it - the length adds up, the stream ends where it should,
+        /// the host returns 200/206 and the player shows garbage or nothing at all.
+        ///
+        /// The old parser answered a single bool and used -1 sentinels for the states it could
+        /// not express, so a 206 with NO Content-Range skipped every position check and was
+        /// spliced in on faith. Each case below is a header a real proxy or cache emits.
+        /// </summary>
+        private static async Task UntrustworthyContentRangeAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("206 whose Content-Range cannot place the body is refused", async () =>
+            {
+                const long Offset = 2_000_000, Length = 300_000;
+
+                // name -> header value (null = omit the header entirely)
+                var cases = new (string Name, Func<long, long, string> Header)[]
+                {
+                    ("absent",            (f, t) => null),
+                    ("unparseable",       (f, t) => "bytes garbage"),
+                    ("wrong unit",        (f, t) => "items " + f + "-" + t + "/" + FileSize),
+                    ("unsatisfied */N",   (f, t) => "bytes */" + FileSize),
+                    ("to < from",         (f, t) => "bytes " + t + "-" + f + "/" + FileSize),
+                    ("negative from",     (f, t) => "bytes -5-" + t + "/" + FileSize),
+                    ("total <= to",       (f, t) => "bytes " + f + "-" + t + "/" + f),
+                    ("wrong start",       (f, t) => "bytes " + (f + 1) + "-" + t + "/" + FileSize)
+                };
+
+                using (MockServer srv = new MockServer(FileSize, fastContent: false))
+                {
+                    // The body deliberately starts at zero, so a case that is NOT rejected
+                    // delivers plausible-looking bytes from the wrong place and the byte
+                    // comparison below catches it even if no exception was thrown.
+                    srv.BodyOffset = (f, t) => 0;
+                    List<string> leaked = new List<string>();
+                    foreach (var c in cases)
+                    {
+                        srv.ContentRangeHeader = c.Header;
+                        try
+                        {
+                            Fetched f = await FetchAsync(srv.Url, Offset, Length, Small(), ct).ConfigureAwait(false);
+                            // Getting here at all is a failure unless the bytes are somehow right.
+                            bool correct = true;
+                            byte[] want = Pattern.Range(Offset, f.Data.Length);
+                            for (int i = 0; i < f.Data.Length && correct; i++) correct = f.Data[i] == want[i];
+                            leaked.Add(c.Name + (correct ? " (accepted, bytes correct)" : " (ACCEPTED WRONG BYTES)"));
+                        }
+                        catch (IOException)
+                        {
+                            // refused - the only acceptable outcome
+                        }
+                    }
+                    srv.ContentRangeHeader = null;
+                    srv.BodyOffset = null;
+
+                    Harness.Assert(leaked.Count == 0,
+                        "these headers were accepted instead of refused: " + string.Join(", ", leaked));
+
+                    // Control: with an honest header and an honest body it still works, so the
+                    // test is not passing merely because everything is rejected.
+                    Fetched ok = await FetchAsync(srv.Url, Offset, Length, Small(), ct).ConfigureAwait(false);
+                    Harness.AssertBytesEqual(Pattern.Range(Offset, Length), ok.Data, "control bytes");
+                    return cases.Length + " bad headers refused, honest one still served";
+                }
+            }).ConfigureAwait(false);
+
+            await Harness.RunAsync("mid-transfer change of complete-length is not spliced", async () =>
+            {
+                using (MockServer srv = new MockServer(FileSize, fastContent: false))
+                {
+                    // Probe (request 1) sees the real size; every later chunk claims the object
+                    // grew. Same offsets, same lengths, plausible everywhere - only the total
+                    // gives it away, and that total used to be parsed and thrown away.
+                    srv.ContentRangeTotal = (f, t) => f == 0 ? FileSize : FileSize + 4096;
+                    bool threw = false;
+                    try
+                    {
+                        await FetchAsync(srv.Url, 0, 512 * 1024, Small(), ct).ConfigureAwait(false);
+                    }
+                    catch (IOException)
+                    {
+                        threw = true;
+                    }
+                    finally { srv.ContentRangeTotal = null; }
+
+                    Harness.Assert(threw, "a resource that changed size mid-transfer was spliced together anyway");
+                    return "version change detected via complete-length";
+                }
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Regression for the host contract, not for this component in isolation.
+        ///
+        /// Stock Emby 4.9.3.0 FileWriter.SetContentResponseHeaders does
+        ///     TotalContentLength = handler.TotalLength ?? handler.Stream?.Length
+        /// so a null TotalLength silently promotes this stream's RANGE length to the resource's
+        /// complete length - the Content-Range denominator, and the clamp on the copy. There is
+        /// no correct value to publish without a total, so the only safe answer is to decline
+        /// and let Emby serve the request itself.
+        /// </summary>
+        private static async Task UnknownTotalAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("206 with \"/*\" declines rather than inventing a total", async () =>
+            {
+                using (MockServer srv = new MockServer(FileSize, fastContent: false))
+                {
+                    srv.ContentRangeHeader = (f, t) => "bytes " + f + "-" + t + "/*";
+                    try
+                    {
+                        // Bounded range: this is the shape that used to be accepted with
+                        // totalLength = null.
+                        long? total, cl;
+                        Stream s = ParallelFetch.TryOpen(srv.Url, 1_000_000, 200_000, out total, out cl, ct);
+                        if (s != null) s.Dispose();
+                        Harness.Assert(s == null, "TryOpen returned a stream with no resource total; " +
+                                                  "the host would publish its range length as the file length");
+                        Harness.Assert(!total.HasValue, "totalLength must be null on the fallback path");
+
+                        // Open-ended too, for symmetry.
+                        Stream s2 = ParallelFetch.TryOpen(srv.Url, 0, 0, out total, out cl, ct);
+                        if (s2 != null) s2.Dispose();
+                        Harness.Assert(s2 == null, "open-ended request with unknown total must also decline");
+                    }
+                    finally { srv.ContentRangeHeader = null; }
+
+                    await Task.CompletedTask;
+                    return "declined both bounded and open-ended";
+                }
+            }).ConfigureAwait(false);
+
+            await Harness.RunAsync("Stream.Length refuses to pose as the resource length", async () =>
+            {
+                using (MockServer srv = new MockServer(FileSize, fastContent: false))
+                {
+                    long? total, cl;
+                    using (Stream s = ParallelFetch.OpenWith(srv.Url, 1_000_000, 200_000, Small(), out total, out cl, ct))
+                    {
+                        Harness.AssertEqual(FileSize, total.Value, "totalLength is the resource size");
+                        Harness.AssertEqual(200_000, cl.Value, "contentLength is the range size");
+                        bool threw = false;
+                        try { long _ = s.Length; } catch (NotSupportedException) { threw = true; }
+                        Harness.Assert(threw,
+                            "Stream.Length returned a number; Emby would publish it as the complete length");
+                    }
+                    await Task.CompletedTask;
+                    return "Length throws, TotalLength carries the truth";
+                }
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Byte offsets into a re-encoded body point at the wrong media bytes. We never ask for
+        /// compression, but "did not ask" is not "cannot receive" - absent an Accept-Encoding a
+        /// server may pick any encoding (RFC 7231 5.3.4), so the request pins identity AND the
+        /// response is checked.
+        /// </summary>
+        private static async Task ContentEncodingAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("requests pin identity and a re-encoded response is refused", async () =>
+            {
+                using (MockServer srv = new MockServer(FileSize, fastContent: false))
+                {
+                    srv.ContentEncoding = "gzip";
+                    bool declined;
+                    try
+                    {
+                        long? t, c;
+                        Stream s = ParallelFetch.TryOpen(srv.Url, 0, 100_000, out t, out c, ct);
+                        if (s != null) s.Dispose();
+                        declined = s == null;
+                    }
+                    finally { srv.ContentEncoding = null; }
+                    Harness.Assert(declined, "a gzip-encoded 206 was accepted and would have been spliced by offset");
+
+                    srv.ResetCounters();
+                    Fetched ok = await FetchAsync(srv.Url, 0, 100_000, Small(), ct).ConfigureAwait(false);
+                    Harness.AssertBytesEqual(Pattern.Range(0, 100_000), ok.Data, "control bytes");
+
+                    int pinned = 0, total = 0;
+                    foreach (string ae in srv.AcceptEncodings)
+                    {
+                        total++;
+                        if (ae.IndexOf("identity", StringComparison.OrdinalIgnoreCase) >= 0) pinned++;
+                    }
+                    Harness.Assert(total > 0 && pinned == total,
+                        "only " + pinned + " of " + total + " requests sent Accept-Encoding: identity");
+                    return pinned + "/" + total + " requests pinned identity";
+                }
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// The origin answers 503 once enough connections pile up. Backing off on a fixed
+        /// exponential timer ignores what it actually asked for and lets every worker return in
+        /// lockstep - the same herd that caused the 503.
+        /// </summary>
+        private static async Task RetryAfterAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("503 Retry-After is waited out, not out-guessed", async () =>
+            {
+                using (MockServer srv = new MockServer(FileSize, fastContent: false))
+                {
+                    srv.RetryAfter = "1";                       // one second, far above the 10ms backoff
+                    srv.FaultHook = (seq, f, t) => seq == 1 ? MockFault.Status503RetryAfter : MockFault.None;
+                    try
+                    {
+                        Fetched got = await FetchAsync(srv.Url, 0, 128 * 1024, Small(), ct).ConfigureAwait(false);
+                        Harness.AssertBytesEqual(Pattern.Range(0, 128 * 1024), got.Data, "bytes after the 503");
+                    }
+                    finally { srv.FaultHook = null; srv.RetryAfter = null; }
+
+                    long[] ticks = srv.RequestTicks.ToArray();
+                    Harness.Assert(ticks.Length >= 2, "expected a retry after the 503");
+                    long waited = ticks[1] - ticks[0];
+                    Harness.Assert(waited >= 900,
+                        "came back after " + waited + " ms; the server asked for 1000 ms " +
+                        "(the local backoff is 10 ms, so ignoring Retry-After is visible here)");
+                    return "waited " + waited + " ms for a Retry-After: 1";
+                }
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// A worker can die outside a chunk download - during the connection ramp, or between
+        /// claiming a chunk and publishing its channel. Setting the fault flag alone stopped
+        /// every other worker from claiming while nothing poisoned a channel, so the reader
+        /// waited on a slot that would never become ready: playback froze with no error, no log
+        /// line the operator would look for, and no fallback. A hang is the one failure mode a
+        /// media server cannot recover from on its own, so it has to become an exception.
+        ///
+        /// Provoked here the way the review found it: a ramp interval past what Task.Delay
+        /// accepts, which throws inside the worker before it ever claims work.
+        /// </summary>
+        private static async Task WorkerStartupFailureAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("a worker dying outside a chunk fails fast instead of hanging", async () =>
+            {
+                using (MockServer srv = new MockServer(FileSize, fastContent: false))
+                {
+                    // Options are built PAST Normalize() on purpose. Normalize now bounds the
+                    // ramp interval, so this value can no longer arrive from configuration - but
+                    // that bound is a second line of defence, and this test is for the first
+                    // one. Going through OpenWith here would prove nothing, because the clamp
+                    // would keep the worker alive and the test would pass vacuously.
+                    ParallelFetchOptions o = Small().Normalize();
+                    o.InitialConnections = 1;                          // workers 1..3 must wait
+                    o.ConnectionRampInterval = TimeSpan.FromDays(60);  // past Task.Delay's ceiling
+
+                    // Throttled so the one surviving worker cannot race to the end of the range
+                    // and finish before the others have thrown.
+                    srv.ThrottleBytesPerSec = 2 * 1024 * 1024;
+                    const long Length = 2 * 1024 * 1024;
+
+                    HttpClient client = HttpClientHolder.CreateForStream();   // the stream takes ownership
+                    HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Get, srv.Url);
+                    req.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, o.FirstChunkSize - 1);
+                    HttpResponseMessage probe = await client
+                        .SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+
+                    Stopwatch sw = Stopwatch.StartNew();
+                    using (Stream s = new ParallelRangeStream(client, srv.Url, 0, Length, FileSize, o, probe, ct))
+                    using (CancellationTokenSource guard = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                    {
+                        guard.CancelAfter(TimeSpan.FromSeconds(15));
+                        try
+                        {
+                            await Harness.ReadAllAsync(s, 32 * 1024, guard.Token).ConfigureAwait(false);
+                            throw new Exception("the doomed stream completed; this test no longer provokes " +
+                                                "a worker failure and is not testing anything");
+                        }
+                        catch (OperationCanceledException) when (guard.IsCancellationRequested && !ct.IsCancellationRequested)
+                        {
+                            throw new Exception("the reader hung for 15s: a worker died, nothing poisoned a " +
+                                                "channel, and no exception ever reached the consumer");
+                        }
+                        catch (Exception ex)
+                        {
+                            sw.Stop();
+                            return "surfaced as " + ex.GetType().Name + " in " +
+                                   sw.Elapsed.TotalSeconds.ToString("0.00") + "s";
+                        }
+                    }
+                }
+            }).ConfigureAwait(false);
         }
 
         /// <summary>

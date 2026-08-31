@@ -73,22 +73,42 @@ namespace EmbyStrmParallel
         /// <summary>
         /// A short, non-sensitive identifier for a url.
         ///
-        /// The query string is dropped outright and the last 40 characters of what remains are
-        /// kept. On the real origin the signature lives entirely in the query (51 of 245 chars),
-        /// while the path's trailing component is a 53-char file id - so this is both safer than
-        /// a blind tail-40 (which would be pure signature) and more useful for telling two
-        /// requests apart. Dropping the query first also means a *short* signed url cannot leak
-        /// in full.
+        /// Fragment, query and userinfo are removed outright, then the last 40 characters of
+        /// what remains are kept. On the real origin the signature lives entirely in the query
+        /// (51 of 245 chars), while the path's trailing component is a 53-char file id - so this
+        /// is both safer than a blind tail-40 (which would be pure signature) and more useful
+        /// for telling two requests apart. Dropping the query first also means a *short* signed
+        /// url cannot leak in full.
+        ///
+        /// The userinfo and fragment cases do not arise on this origin; they are stripped
+        /// because a log line outlives the deployment that produced it, and `https://u:p@host/f`
+        /// is under 40 characters, so a blind tail would have kept the credentials intact.
         /// </summary>
         internal static string Tail(string url)
         {
             if (string.IsNullOrEmpty(url)) return "(none)";
-            int q = url.IndexOf('?');
-            string withoutQuery = q >= 0 ? url.Substring(0, q) : url;
-            string tail = withoutQuery.Length <= TailLength
-                ? withoutQuery
-                : "..." + withoutQuery.Substring(withoutQuery.Length - TailLength);
-            return q >= 0 ? tail + "?<redacted>" : tail;
+
+            string s = url;
+            int hash = s.IndexOf('#');
+            if (hash >= 0) s = s.Substring(0, hash);
+
+            int q = s.IndexOf('?');
+            bool hadQuery = q >= 0;
+            if (hadQuery) s = s.Substring(0, q);
+
+            // Only inside the authority: '@' is legal in a path and must not truncate it there.
+            int scheme = s.IndexOf("://", StringComparison.Ordinal);
+            if (scheme >= 0)
+            {
+                int authStart = scheme + 3;
+                int authEnd = s.IndexOf('/', authStart);
+                if (authEnd < 0) authEnd = s.Length;
+                int at = s.IndexOf('@', authStart);
+                if (at >= 0 && at < authEnd) s = s.Substring(0, authStart) + s.Substring(at + 1);
+            }
+
+            string tail = s.Length <= TailLength ? s : "..." + s.Substring(s.Length - TailLength);
+            return hadQuery ? tail + "?<redacted>" : tail;
         }
 
         /// <summary>Byte counts in whichever unit does not round to zero.</summary>

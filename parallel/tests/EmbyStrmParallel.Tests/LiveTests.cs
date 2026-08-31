@@ -129,7 +129,8 @@ namespace EmbyStrmParallel.Tests
                 {
                     Harness.AssertEqual(total, t.Value, "totalLength");
                     Harness.AssertEqual(total, cl.Value, "contentLength");
-                    Harness.AssertEqual(total, s.Length, "Stream.Length");
+                    // Not Stream.Length: that is the range size, and the host would publish it
+                    // as the resource's complete length. It throws on purpose.
                     await Task.CompletedTask;
                 }
                 return "whole file = " + total;

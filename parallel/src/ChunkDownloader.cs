@@ -33,14 +33,17 @@ namespace EmbyStrmParallel
         private readonly ParallelFetchOptions _o;
         private readonly string _tag;
         private readonly StreamStats _stats;
+        private readonly long _resourceTotal;
 
-        internal ChunkDownloader(HttpClient client, string url, ParallelFetchOptions options, string tag, StreamStats stats)
+        internal ChunkDownloader(HttpClient client, string url, ParallelFetchOptions options, string tag,
+                                 StreamStats stats, long resourceTotal)
         {
             _client = client;
             _url = url;
             _o = options;
             _tag = tag;
             _stats = stats;
+            _resourceTotal = resourceTotal;
         }
 
         /// <summary>
@@ -87,6 +90,7 @@ namespace EmbyStrmParallel
 
                 HttpResponseMessage response = null;
                 CancellationTokenSource phase = null;
+                long retryAfterMs = -1;
                 try
                 {
                     phase = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -103,6 +107,7 @@ namespace EmbyStrmParallel
                         response = await SendAsync(cursor.Pos, endInclusive, phase.Token).ConfigureAwait(false);
                     }
 
+                    retryAfterMs = HttpRangeHelper.RetryAfterMs(response);
                     ValidateResponse(response, cursor.Pos, endInclusive);
 
                     using (Stream body = await response.Content.ReadAsStreamAsync(phase.Token).ConfigureAwait(false))
@@ -131,10 +136,17 @@ namespace EmbyStrmParallel
 
                     attempt++;
                     _stats.Retry();
-                    int delay = BackoffMs(attempt);
+                    // Bounded by whatever is left of the stall budget: an origin that answers
+                    // "Retry-After: 3600" must not park a chunk for an hour, but neither should
+                    // we come back before it asked. Sleeping out the remainder means the next
+                    // pass through the loop reports the failure, which is the right outcome.
+                    long budgetLeft = stallBudgetMs - (Environment.TickCount64 - cursor.LastProgressTicks);
+                    long delay = HttpRangeHelper.RetryDelayMs(BackoffMs(attempt), retryAfterMs);
+                    if (delay > budgetLeft) delay = budgetLeft;
+                    if (delay < 0) delay = 0;
                     FetchLog.Write(_tag + " chunk [" + start + "-" + endInclusive + "] retry " + attempt + "/" +
                                    (_o.MaxAttempts - 1) + " resuming at " + cursor.Pos + " after " + FetchLog.Describe(ex));
-                    await Task.Delay(delay, ct).ConfigureAwait(false);
+                    await Task.Delay((int)delay, ct).ConfigureAwait(false);
                 }
                 finally
                 {
@@ -155,12 +167,19 @@ namespace EmbyStrmParallel
             // Always the ORIGINAL url: the 302 is re-followed and the time-limited target re-signed.
             HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Get, _url);
             req.Headers.Range = new RangeHeaderValue(from, toInclusive);
+            req.Headers.AcceptEncoding.Add(new StringWithQualityHeaderValue("identity"));
             req.Version = HttpVersion.Version11;
             req.VersionPolicy = HttpVersionPolicy.RequestVersionOrLower;
             return _client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
         }
 
-        private static void ValidateResponse(HttpResponseMessage response, long expectedFrom, long expectedTo)
+        /// <summary>
+        /// Everything that must hold before a single byte of this response is spliced into the
+        /// output. All of it is about POSITION, not size: a chunk that arrives with the right
+        /// length from the wrong offset is invisible downstream, because the byte count still
+        /// adds up and the stream still ends where it should.
+        /// </summary>
+        private void ValidateResponse(HttpResponseMessage response, long expectedFrom, long expectedTo)
         {
             if (response.StatusCode != HttpStatusCode.PartialContent)
             {
@@ -173,17 +192,35 @@ namespace EmbyStrmParallel
                                                null, response.StatusCode);
             }
 
+            HttpRangeHelper.EnsureIdentityEncoding(response);
+
             long from, to, total;
-            if (HttpRangeHelper.TryGetContentRange(response, out from, out to, out total))
+            ContentRangeStatus status = HttpRangeHelper.ParseContentRange(response, out from, out to, out total);
+            if (status != ContentRangeStatus.Valid)
             {
-                if (from >= 0 && from != expectedFrom)
-                {
-                    throw new IOException("Content-Range start " + from + " does not match requested " + expectedFrom + ".");
-                }
-                if (to >= 0 && to > expectedTo)
-                {
-                    throw new IOException("Content-Range end " + to + " exceeds requested " + expectedTo + ".");
-                }
+                // Used to be "if it parsed, check it" - so a response with no Content-Range at all
+                // skipped every check below and was spliced in on faith.
+                throw new IOException("Chunk response carries " + HttpRangeHelper.Describe(status) +
+                                      "; cannot confirm it starts at " + expectedFrom + ".");
+            }
+            if (from != expectedFrom)
+            {
+                throw new IOException("Content-Range start " + from + " does not match requested " + expectedFrom + ".");
+            }
+            if (to > expectedTo)
+            {
+                throw new IOException("Content-Range end " + to + " exceeds requested " + expectedTo + ".");
+            }
+
+            // Every chunk re-follows the original url and is re-signed, so nothing guarantees all
+            // of them see the same object. A total that has moved means the resource changed
+            // underneath us, and the pieces already delivered belong to a different version.
+            // This catches any change of length; a same-length replacement still needs a strong
+            // validator (If-Range), which this origin does not supply.
+            if (_resourceTotal >= 0 && total >= 0 && total != _resourceTotal)
+            {
+                throw new IOException("Origin changed complete-length mid-transfer (probe saw " + _resourceTotal +
+                                      ", this response says " + total + "); refusing to splice two versions.");
             }
         }
 

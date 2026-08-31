@@ -11,20 +11,30 @@ echo "== build =="
 dotnet build -c Release -v q --nologo template/template.csproj
 dotnet build -c Release -v q --nologo patcher/patcher.csproj
 dotnet build -c Release -v q --nologo rtcheck/rtcheck.csproj
+dotnet build -c Release -v q --nologo parallel/src/EmbyStrmParallel.csproj
 dotnet build -c Release -v q --nologo tests/behaviour/behaviour.csproj
 dotnet build -c Release -v q --nologo tests/fixture-redirect/fixture.csproj
 dotnet build -c Release -v q --nologo tests/fixture-notranscode/fixture.csproj
 
 TPL=$ROOT/template/bin/Release/net8.0/StrmDirectTemplate.dll
+HELPER=$ROOT/parallel/src/bin/Release/net8.0/EmbyStrmParallel.dll
 FR=$ROOT/tests/fixture-redirect/bin/Release/net8.0
 FN=$ROOT/tests/fixture-notranscode/bin/Release/net8.0
 
 echo
 echo "== patch the fixtures =="
+# --parallel on purpose: without it patch C's IL is never executed by any test, and a helper
+# that works in isolation proves nothing about whether Emby ever calls it. See run.sh's
+# behaviour step, section 7.
 dotnet run -c Release --no-build --project patcher -- \
-  "$FR/Emby.Server.Implementations.dll" "$OUT/Emby.Server.Implementations.dll" "$FR" "$TPL"
+  "$FR/Emby.Server.Implementations.dll" "$OUT/Emby.Server.Implementations.dll" "$FR" "$TPL" \
+  --parallel "$HELPER"
 dotnet run -c Release --no-build --project patcher -- \
   "$FN/Emby.Server.MediaEncoding.dll" "$OUT/Emby.Server.MediaEncoding.dll" "$FN" "$TPL"
+
+# The patched assembly now references EmbyStrmParallel; on a real install that is the deps.json
+# step, here it just has to sit beside the assembly that loads it.
+cp "$HELPER" "$OUT/"
 
 echo
 echo "== idempotency: patching a patched assembly must be refused =="
@@ -55,8 +65,9 @@ dotnet run -c Release --no-build --project tests/behaviour -- \
 echo
 echo "== check-config =="
 # The fixtures carry the real type names and get the real marker fields, so `embypatch check`
-# reads them exactly as it would read a live install. $OUT stands in for system/: patch A and B
-# are present, C is not, which is the escape-hatch shape.
+# reads them exactly as it would read a live install. $OUT stands in for system/: A, B and C are
+# all patched in, but EmbyServer.deps.json is absent - which is the shape of the mistake that
+# actually happens, a helper dropped next to the assembly without being registered.
 PD=$OUT/programdata; mkdir -p "$PD/config"
 CFG=$PD/config/strm-routing.txt
 CHECK_FAIL=0
@@ -80,7 +91,29 @@ printf '# plain url lines\nhttps://plain.example/\nhttps://two.example/d/  302\n
 check_case "plain 302 config is satisfiable" 0 "OK   2 route(s)"
 
 printf 'https://par.example/  parallel\n' > "$CFG"
-check_case "parallel without patch C is unsatisfiable" 1 "UNSATISFIABLE"
+check_case "parallel without a deps.json entry is unsatisfiable" 1 "not registered in EmbyServer.deps.json"
+
+# Registering the helper is the step people forget: dropping the DLL into system/ is not enough,
+# because the assembly manifest decides what loads. With the entry AND the dependency edge in
+# place the same config becomes satisfiable, which is what makes the message above actionable
+# rather than just a complaint.
+cat > "$OUT/EmbyServer.deps.json" <<'DEPSEOF'
+{
+  "runtimeTarget": { "name": ".NETCoreApp,Version=v8.0" },
+  "targets": {
+    ".NETCoreApp,Version=v8.0": {
+      "Emby.Server.Implementations/1.0.0": {
+        "dependencies": { "EmbyStrmParallel": "1.0.0" },
+        "runtime": { "Emby.Server.Implementations.dll": {} }
+      },
+      "EmbyStrmParallel/1.0.0": { "runtime": { "EmbyStrmParallel.dll": {} } }
+    }
+  },
+  "libraries": {}
+}
+DEPSEOF
+check_case "parallel becomes satisfiable once the helper is registered" 0 "OK   1 route(s)"
+rm -f "$OUT/EmbyServer.deps.json"
 
 printf 'https://typo.example/  paralell\n' > "$CFG"
 check_case "misspelled mode is reported with its line number" 1 "line 1: unknown mode 'paralell'"

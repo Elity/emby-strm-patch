@@ -52,6 +52,7 @@ namespace EmbyStrmParallel
 
         private long _nextChunk;              // guarded by _assign
         private int _faulted;                 // 0/1, stops further chunk claims
+        private Exception _fatal;             // worker died outside a chunk; nothing poisoned a channel
 
         private HttpResponseMessage _preOpened;
 
@@ -68,7 +69,8 @@ namespace EmbyStrmParallel
         private int _disposed;
 
         internal ParallelRangeStream(HttpClient client, string url, long rangeStart, long totalToRead,
-                                     ParallelFetchOptions options, HttpResponseMessage preOpenedFirstChunk,
+                                     long resourceTotal, ParallelFetchOptions options,
+                                     HttpResponseMessage preOpenedFirstChunk,
                                      CancellationToken cancellationToken)
         {
             _o = options;
@@ -82,7 +84,7 @@ namespace EmbyStrmParallel
             _tag = "#" + StreamId;
 
             _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            _downloader = new ChunkDownloader(client, url, options, _tag, _stats);
+            _downloader = new ChunkDownloader(client, url, options, _tag, _stats, resourceTotal);
 
             int slotCount = (int)Math.Min(options.Slots, _chunkCount);
             if (slotCount < 1) slotCount = 1;
@@ -187,8 +189,16 @@ namespace EmbyStrmParallel
             }
             catch (Exception ex)
             {
+                // Reached only when a worker dies OUTSIDE a chunk download - during the ramp
+                // delay, or between claiming a chunk and publishing its channel. Setting
+                // _faulted alone was a deadlock: it stops every other worker from claiming, but
+                // nothing here poisons a channel, so the reader waits on a slot whose Ready is
+                // never released and playback freezes with no error and no fallback. Recording
+                // the exception and cancelling turns a hang into a prompt, explained failure.
                 Interlocked.Exchange(ref _faulted, 1);
+                Interlocked.CompareExchange(ref _fatal, ex, null);
                 FetchLog.Write(_tag + " worker aborted: " + FetchLog.Describe(ex));
+                try { _cts.Cancel(); } catch { }
             }
         }
 
@@ -295,6 +305,12 @@ namespace EmbyStrmParallel
             catch (OperationCanceledException)
             {
                 if (cancellationToken.IsCancellationRequested) throw;
+                Exception fatal = Volatile.Read(ref _fatal);
+                if (fatal != null)
+                {
+                    throw Fail(new IOException("Parallel fetch aborted: a worker failed before it could " +
+                                               "report a chunk (" + FetchLog.Describe(fatal) + ").", fatal));
+                }
                 if (_fault != null) throw Rethrow(_fault);
                 throw Fail(new IOException("Parallel fetch was aborted."));
             }
@@ -364,8 +380,28 @@ namespace EmbyStrmParallel
         public override bool CanWrite { get { return false; } }
         public override bool CanTimeout { get { return false; } }
 
-        /// <summary>Number of bytes this stream will deliver in total. Safe to read; does not imply seekability.</summary>
-        public override long Length { get { return _totalToRead; } }
+        /// <summary>
+        /// Deliberately unsupported.
+        ///
+        /// This stream's size is the size of the REQUESTED RANGE, which is not what the host
+        /// means when it reads Stream.Length. Stock Emby 4.9.3.0 does:
+        ///     TotalContentLength = handler.TotalLength ?? handler.Stream?.Length
+        /// so any number returned here would be published as the resource's complete length -
+        /// the Content-Range denominator - and would clamp the copy. Returning the range size
+        /// looked reasonable and was silently wrong for every non-zero offset.
+        ///
+        /// Throwing is the safe answer, and it is the answer the host is built for: that whole
+        /// expression sits inside a `catch (NotSupportedException)`, so TotalLength simply stays
+        /// unset. Use TotalToRead when the delivered size is what you actually want.
+        /// </summary>
+        public override long Length
+        {
+            get
+            {
+                throw new NotSupportedException(
+                    "ParallelRangeStream delivers a range; its size is not the resource length. Use TotalLength.");
+            }
+        }
 
         public override long Position
         {
