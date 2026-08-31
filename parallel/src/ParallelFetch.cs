@@ -126,7 +126,13 @@ namespace EmbyStrmParallel
             long probeSpan = ChunkSchedule.ProbeSpan(length, o.FirstChunkSize);
             long probeEnd = offset + probeSpan - 1;
 
-            HttpResponseMessage response = SendProbe(client, url, offset, probeEnd, o, cancellationToken);
+            // A 200 here means the origin ignored Range, and the only way to honour the request
+            // from a whole-resource body is to read and discard everything ahead of `offset`.
+            // Worth doing for a small offset; ruinous for a large one. See
+            // ParallelFetchOptions.MaxIgnoredRangeSkipBytes.
+            bool refuseWholeBody = offset > o.MaxIgnoredRangeSkipBytes;
+
+            HttpResponseMessage response = SendProbe(client, url, offset, probeEnd, o, refuseWholeBody, cancellationToken);
             bool handedOff = false;
             try
             {
@@ -151,7 +157,8 @@ namespace EmbyStrmParallel
                     handedOff = true;
                     clientHandedOff = true;
                     FetchLog.Write("open path=single-conn-fallback (origin ignored Range) url=" + FetchLog.Tail(url) +
-                                   " offset=" + offset + " length=" + eff0 + " total=" + full);
+                                   " offset=" + offset + " length=" + eff0 + " total=" + full +
+                                   " skip=" + FetchLog.Size(offset));
                     return new SkipLimitStream(response, body0, client, offset, eff0, o.ReadIdleTimeout);
                 }
 
@@ -241,18 +248,25 @@ namespace EmbyStrmParallel
         }
 
         private static HttpResponseMessage SendProbe(HttpClient client, string url, long from, long toInclusive,
-                                                     ParallelFetchOptions o, CancellationToken cancellationToken)
+                                                     ParallelFetchOptions o, bool refuseWholeBody,
+                                                     CancellationToken cancellationToken)
         {
-            return SendProbeAsync(client, url, from, toInclusive, o, cancellationToken).GetAwaiter().GetResult();
+            return SendProbeAsync(client, url, from, toInclusive, o, refuseWholeBody, cancellationToken).GetAwaiter().GetResult();
         }
 
         /// <summary>
         /// The probe IS chunk 0, so it gets the same bounded retry as any other chunk. Without
         /// this a single 403 from an expired redirect target - the exact failure this origin
         /// produces - would fail the whole request before a single byte was fetched.
+        ///
+        /// refuseWholeBody folds "the origin ignored Range on a far offset" into that same
+        /// machinery. Direct probing answered 206 for that shape 21 times out of 21, including
+        /// under concurrent load, so a 200 there is worth retrying; if every attempt gives one,
+        /// the throw becomes a null from TryOpen and Emby serves the request itself.
         /// </summary>
         private static async Task<HttpResponseMessage> SendProbeAsync(HttpClient client, string url, long from, long toInclusive,
-                                                                      ParallelFetchOptions o, CancellationToken cancellationToken)
+                                                                      ParallelFetchOptions o, bool refuseWholeBody,
+                                                                      CancellationToken cancellationToken)
         {
             int attempt = 0;
             // Open() blocks the caller for this whole thing, so the total is capped, not just
@@ -299,6 +313,13 @@ namespace EmbyStrmParallel
                         // caller's token. The response body stays alive and is aborted, if needed,
                         // through the stream's own token instead.
                         probe.Dispose();
+                    }
+
+                    if (refuseWholeBody && response.StatusCode == HttpStatusCode.OK)
+                    {
+                        try { response.Dispose(); } catch { }
+                        throw new IOException("Origin ignored Range and offered the whole resource; serving offset " +
+                                              from + " from it would mean discarding " + FetchLog.Size(from) + ".");
                     }
 
                     if (!HttpRangeHelper.IsTransientStatus(response.StatusCode)) return response;

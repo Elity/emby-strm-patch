@@ -157,6 +157,22 @@ namespace EmbyStrmParallel
         /// <summary>Reading time an attempt gets before the throughput floor applies (TCP ramp, redirect).</summary>
         public TimeSpan MinThroughputGrace { get; set; } = TimeSpan.FromSeconds(6);
 
+        /// <summary>
+        /// How far the degraded "origin ignored Range" path may skip before it is refused.
+        ///
+        /// That path answers a ranged request from a 200 whole-resource body by reading and
+        /// discarding everything ahead of the offset. For a small offset that is a reasonable
+        /// way to stay byte-exact against an origin with no Range support. For a large one it is
+        /// indefensible: production hit this three times, every one of them a far-tail read, and
+        /// the worst asked for the last 2083 bytes of a 10.48 GB file — 10.48 GB downloaded and
+        /// thrown away to deliver 2 KB, with nothing in the log saying so.
+        ///
+        /// Past this ceiling the fetcher retries the probe (the origin answered 206 for the same
+        /// shape on 21 out of 21 direct attempts, so a 200 there looks transient) and then
+        /// declines, handing the request back to Emby rather than spending the bandwidth.
+        /// </summary>
+        public long MaxIgnoredRangeSkipBytes { get; set; } = 64L * 1024 * 1024;
+
         // ---- derived, filled in by Normalize() ----
 
         internal int Slots { get; private set; }
@@ -209,6 +225,7 @@ namespace EmbyStrmParallel
             if (o.StallBudget <= TimeSpan.Zero) o.StallBudget = TimeSpan.FromSeconds(30);
             if (o.MinThroughputBytesPerSec < 0) o.MinThroughputBytesPerSec = 0;
             if (o.MinThroughputGrace <= TimeSpan.Zero) o.MinThroughputGrace = TimeSpan.FromSeconds(6);
+            if (o.MaxIgnoredRangeSkipBytes < 0) o.MaxIgnoredRangeSkipBytes = 0;
 
             return o;
         }

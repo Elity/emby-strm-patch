@@ -18,8 +18,12 @@ namespace EmbyStrmParallel
         private readonly Stream _inner;
         private readonly HttpClient _client;
         private readonly TimeSpan _readIdleTimeout;
+        private readonly long _skipTotal;
+        private readonly long _limit;
+        private readonly long _startTicks = Environment.TickCount64;
         private long _toSkip;
         private long _remaining;
+        private long _delivered;
         private int _disposed;
 
         internal SkipLimitStream(HttpResponseMessage response, Stream inner, HttpClient client,
@@ -29,6 +33,8 @@ namespace EmbyStrmParallel
             _inner = inner;
             _client = client;
             _readIdleTimeout = readIdleTimeout;
+            _skipTotal = skip;
+            _limit = limit;
             _toSkip = skip;
             _remaining = limit;
         }
@@ -83,6 +89,7 @@ namespace EmbyStrmParallel
             int read = await ReadInnerAsync(buffer.Slice(0, take), cancellationToken).ConfigureAwait(false);
             if (read <= 0) throw new IOException("Stream ended " + _remaining + " bytes short of the requested range.");
             _remaining -= read;
+            _delivered += read;
             return read;
         }
 
@@ -114,11 +121,26 @@ namespace EmbyStrmParallel
         {
             if (Interlocked.Exchange(ref _disposed, 1) == 0)
             {
+                // The parallel path reports one line per stream at close; this one used to report
+                // nothing at all, which made the most expensive path in the component the only
+                // invisible one. When production discarded 1.47 GB to deliver 637 KB there was no
+                // way to tell from the log how long it took or whether it even finished.
+                LogSummary();
                 try { _inner.Dispose(); } catch { }
                 try { _response.Dispose(); } catch { }
                 if (_client != null) { try { _client.Dispose(); } catch { } }
             }
             base.Dispose(disposing);
+        }
+
+        private void LogSummary()
+        {
+            if (!FetchLog.IsEnabled) return;
+            long ms = Math.Max(1, Environment.TickCount64 - _startTicks);
+            FetchLog.Write("single-conn closed " + (_delivered >= _limit ? "complete" : "ABANDONED") +
+                           " skipped=" + FetchLog.Size(_skipTotal - _toSkip) + "/" + FetchLog.Size(_skipTotal) +
+                           " delivered=" + FetchLog.Size(_delivered) + "/" + FetchLog.Size(_limit) +
+                           " elapsed=" + (ms / 1000.0).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + "s");
         }
     }
 }

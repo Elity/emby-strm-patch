@@ -424,6 +424,7 @@ namespace EmbyStrmParallel.Tests
 
             await UntrustworthyContentRangeAsync(ct).ConfigureAwait(false);
             await UnknownTotalAsync(ct).ConfigureAwait(false);
+            await IgnoredRangeSkipCeilingAsync(ct).ConfigureAwait(false);
             await ContentEncodingAsync(ct).ConfigureAwait(false);
             await RetryAfterAsync(ct).ConfigureAwait(false);
 
@@ -528,6 +529,97 @@ namespace EmbyStrmParallel.Tests
                     Harness.Assert(threw, "a resource that changed size mid-transfer was spliced together anyway");
                     return "version change detected via complete-length";
                 }
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// When an origin ignores Range, the only way to serve a ranged request from the 200 body
+        /// is to read and discard everything ahead of the offset. That is fine near the start of a
+        /// resource and ruinous near the end, and production only ever hit it near the end: three
+        /// occurrences, all far-tail reads, the worst discarding 10.48 GB to deliver 2083 bytes —
+        /// and the delivered bytes were correct, so nothing downstream could tell.
+        ///
+        /// The invariant: below the ceiling, still byte-exact; above it, decline and let the host
+        /// serve the request rather than spend the bandwidth.
+        /// </summary>
+        private static async Task IgnoredRangeSkipCeilingAsync(CancellationToken ct)
+        {
+            await Harness.RunAsync("origin ignoring Range: skip below the ceiling stays exact", async () =>
+            {
+                using (MockServer srv = new MockServer(FileSize, fastContent: false))
+                {
+                    ParallelFetchOptions o = Small();
+                    o.MaxIgnoredRangeSkipBytes = 4 * 1024 * 1024;
+                    srv.FaultHook = (seq, f, t) => MockFault.IgnoreRange;
+                    try
+                    {
+                        Fetched got = await FetchAsync(srv.Url, 1024 * 1024, 200000, o, ct).ConfigureAwait(false);
+                        Harness.AssertBytesEqual(Pattern.Range(1024 * 1024, 200000), got.Data, "bytes");
+                        Harness.AssertEqual(FileSize, got.Total.Value, "totalLength");
+                        return "1 MiB skip accepted, bytes exact";
+                    }
+                    finally { srv.FaultHook = null; }
+                }
+            }).ConfigureAwait(false);
+
+            await Harness.RunAsync("origin ignoring Range: a far offset declines instead of discarding", async () =>
+            {
+                int attempts;
+                using (MockServer srv = new MockServer(FileSize, fastContent: false))
+                {
+                    ParallelFetchOptions o = Small();
+                    o.MaxIgnoredRangeSkipBytes = 1024 * 1024;   // production default is 64 MiB
+                    o.MaxAttempts = 2;                          // keep the retry loop short
+                    srv.FaultHook = (seq, f, t) => MockFault.IgnoreRange;
+                    srv.ResetCounters();
+                    bool declined = false;
+                    try
+                    {
+                        // The shape production hit: the last 2 KB of the resource.
+                        long offset = FileSize - 2083;
+                        long? total, cl;
+                        Stream s = ParallelFetch.OpenWith(srv.Url, offset, 2083, o, out total, out cl, ct);
+                        long served = 0;
+                        if (s != null)
+                        {
+                            using (s) served = await Harness.DrainAsync(s, 32 * 1024, 0, ct, null).ConfigureAwait(false);
+                        }
+                        throw new Exception("a " + (offset / 1024 / 1024) + " MiB skip was accepted to deliver " +
+                                            served + " bytes instead of declining");
+                    }
+                    catch (IOException)
+                    {
+                        declined = true;   // TryOpen turns this into null and the host takes over
+                    }
+                    finally { srv.FaultHook = null; }
+                    Harness.Assert(declined, "expected the far-offset skip to be refused");
+
+                    // It must also have RETRIED rather than given up on the first 200: direct
+                    // probing answered 206 for this exact shape 21 times out of 21, so a single
+                    // 200 is worth one more attempt before handing the request back.
+                    Harness.Assert(srv.RequestCount >= 2,
+                        "declined after only " + srv.RequestCount + " request(s); the 200 should be retried first");
+                    attempts = srv.RequestCount;
+                }
+
+                // TryOpen takes no options, so this half exercises the PRODUCTION default ceiling
+                // (64 MiB) rather than a lowered one, on a resource big enough to exceed it.
+                using (MockServer big = new MockServer(200L * 1024 * 1024, fastContent: true))
+                {
+                    big.FaultHook = (seq, f, t) => MockFault.IgnoreRange;
+                    try
+                    {
+                        long? t2, c2;
+                        Stream s2 = ParallelFetch.TryOpen(big.Url, 200L * 1024 * 1024 - 2083, 2083, out t2, out c2, ct);
+                        if (s2 != null) s2.Dispose();
+                        Harness.Assert(s2 == null,
+                            "TryOpen accepted a ~200 MiB discard at the default ceiling; it should hand the request to the host");
+                    }
+                    finally { big.FaultHook = null; }
+                }
+
+                await Task.CompletedTask;
+                return "declined after " + attempts + " attempts, fell back to the host";
             }).ConfigureAwait(false);
         }
 

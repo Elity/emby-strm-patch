@@ -250,10 +250,39 @@ the wrong byte *position*, or a hang. Each has a case that genuinely fails witho
 | response carries a non-identity `Content-Encoding` | byte offsets into a re-encoded representation | `run-tests.sh mock` |
 | a worker throws outside a chunk download | reader waits forever: no error, no fallback, playback just freezes | same |
 | 503 with `Retry-After` ignored | retrying before the server said to, reconverging into the herd that caused it | same |
+| origin ignores Range at a far offset | the whole file downloaded and discarded to deliver a few KB | same |
 
 There is only one way to know a new case is worth having: **remove the fix and check that it goes
 red.** All six were verified that way. Before the fix, the Content-Range case accepted 5 of 8
 malformed headers and delivered bytes from the wrong position for every one of them.
+
+### 8.2 Field data behind the "origin ignores Range" row
+
+Of 26 opens in one deployment's log, **3** took the `single-conn-fallback` path, and **every one
+of them was a tail read**:
+
+```
+skip=10484846882  want=2083 bytes    (last 2 KB of a 10.48 GB file)  x2
+skip=1472540135   want=637228 bytes  (last 637 KB of a 1.47 GB file)
+```
+
+That path serves a ranged request out of a 200 whole-resource body by reading and discarding
+everything ahead of the offset — 10.48 GB downloaded to deliver 2083 bytes. **The delivered bytes
+are correct**, so nothing downstream can tell.
+
+Direct probing **could not reproduce it**: the same shapes (tail 2 KB, tail 637 KB) at offsets
+across the resource (0/25/50/75/90/99%), both against an idle origin and with 8 concurrent range
+downloads in flight, returned **21 clean 206s out of 21**. The root cause is therefore unknown —
+only that it is rare and clusters on tail reads.
+
+So the fix does not depend on the root cause: past `MaxIgnoredRangeSkipBytes` (64 MiB) the probe
+is retried — a 200 is worth one more attempt when direct probing says 206 twenty-one times out of
+twenty-one — and then declined, handing the request to the host. Small offsets still take the skip,
+which is the legitimate "this origin has no Range support at all" case.
+
+`SkipLimitStream` also gained a closing log line. **The most expensive path in the component was
+the only one that logged nothing**, so there was no way to tell afterwards how long that 1.47 GB
+discard took, or whether it finished.
 
 ## 9. Prefixes are matched against the **percent-encoded** URL
 
